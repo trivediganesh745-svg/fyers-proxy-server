@@ -1,0 +1,5 @@
+Flask
+fyers_apiv3
+python-dotenv
+gunicorn # For Render deployment
+Flask-Cors # For Cross-Origin Resource Sharing
