@@ -1,9 +1,8 @@
 import os
 from flask import Flask, request, jsonify, redirect, url_for
 from fyers_apiv3 import fyersModel
-# Assuming FyersModel or SessionModel raises a specific exception for invalid tokens
-# If not, you might need to inspect the error message or http status code
-from fyers_apiv3.fyersModel import FyersException # Assuming this exception exists
+# Remove the problematic import:
+# from fyers_apiv3.fyersModel import FyersException # Assuming this exception exists
 from dotenv import load_dotenv
 from flask_cors import CORS
 import datetime
@@ -216,17 +215,20 @@ def make_fyers_api_call(api_method, *args, **kwargs):
     if not fyers_instance:
         app.logger.warning("Fyers API not initialized. Attempting to initialize.")
         if not initialize_fyers_model():
-            raise FyersException("Fyers API not initialized. Please authenticate first.")
+            # If initialization (including refresh) fails, we can't proceed
+            return jsonify({"error": "Fyers API not initialized. Please authenticate first."}), 401
 
     try:
         return api_method(*args, **kwargs)
-    except FyersException as e:
-        # Check if the error is due to an invalid/expired token
-        # Fyers API v3 often returns specific error codes or messages for invalid tokens.
-        # Example: {"s": "error", "code": -100, "message": "Invalid token"}
-        # You might need to refine this check based on actual Fyers error responses.
+    except Exception as e: # Catch a general exception
         error_message = str(e).lower()
-        if "token" in error_message or "authentication" in error_message or "session" in error_message:
+        # Common patterns for token expiry errors in messages or within the exception object
+        # You might need to inspect the 'e' object directly to see if it contains
+        # a response dict or specific error codes from Fyers.
+        # Example: if hasattr(e, 'response') and e.response.get('code') == -100:
+        
+        # Check for keywords that indicate token issues
+        if "token" in error_message or "authenticated" in error_message or "login" in error_message or "invalid_access_token" in error_message:
             app.logger.warning(f"Access token expired or invalid. Attempting to refresh. Original error: {e}")
             if refresh_access_token():
                 app.logger.info("Token refreshed, retrying original request.")
@@ -234,188 +236,154 @@ def make_fyers_api_call(api_method, *args, **kwargs):
                 return api_method(*args, **kwargs) # Retry the call
             else:
                 app.logger.error("Token refresh failed. Cannot fulfill request.")
-                raise FyersException("Fyers API token expired and refresh failed. Please re-authenticate.")
+                # Instead of FyersException, raise a generic Exception or return an error response
+                return jsonify({"error": "Fyers API token expired and refresh failed. Please re-authenticate."}), 401
         else:
-            # Not a token error, re-raise original exception
-            raise
+            # Not a token error, re-raise original exception or return error
+            app.logger.error(f"Non-token related Fyers API error: {e}", exc_info=True)
+            return jsonify({"error": f"Fyers API error: {str(e)}"}), 500
 
 @app.route('/api/fyers/profile')
 def get_profile():
-    try:
-        profile_data = make_fyers_api_call(fyers_instance.get_profile)
-        return jsonify(profile_data)
-    except FyersException as e:
-        app.logger.error(f"Failed to fetch profile: {e}", exc_info=True)
-        return jsonify({"error": f"Failed to fetch profile: {str(e)}"}), 500
-    except Exception as e:
-        app.logger.error(f"An unexpected error occurred while fetching profile: {e}", exc_info=True)
-        return jsonify({"error": f"An unexpected error occurred: {str(e)}"}), 500
+    # make_fyers_api_call now returns a tuple (response, status_code) on error
+    # or the actual data on success.
+    result = make_fyers_api_call(fyers_instance.get_profile)
+    if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], int):
+        # This is an error response from make_fyers_api_call
+        return result
+    return jsonify(result) # It's the actual data
 
 @app.route('/api/fyers/funds')
 def get_funds():
-    try:
-        funds_data = make_fyers_api_call(fyers_instance.funds)
-        return jsonify(funds_data)
-    except FyersException as e:
-        app.logger.error(f"Failed to fetch funds: {e}", exc_info=True)
-        return jsonify({"error": f"Failed to fetch funds: {str(e)}"}), 500
-    except Exception as e:
-        app.logger.error(f"An unexpected error occurred while fetching funds: {e}", exc_info=True)
-        return jsonify({"error": f"An unexpected error occurred: {str(e)}"}), 500
+    result = make_fyers_api_call(fyers_instance.funds)
+    if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], int):
+        return result
+    return jsonify(result)
 
 @app.route('/api/fyers/holdings')
 def get_holdings():
-    try:
-        holdings_data = make_fyers_api_call(fyers_instance.holdings)
-        return jsonify(holdings_data)
-    except FyersException as e:
-        app.logger.error(f"Failed to fetch holdings: {e}", exc_info=True)
-        return jsonify({"error": f"Failed to fetch holdings: {str(e)}"}), 500
-    except Exception as e:
-        app.logger.error(f"An unexpected error occurred while fetching holdings: {e}", exc_info=True)
-        return jsonify({"error": f"An unexpected error occurred: {str(e)}"}), 500
+    result = make_fyers_api_call(fyers_instance.holdings)
+    if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], int):
+        return result
+    return jsonify(result)
 
 @app.route('/api/fyers/history', methods=['POST'])
 def get_history():
+    data = request.json
+    
+    required_params = ["symbol", "resolution", "date_format", "range_from", "range_to"]
+    if not data or not all(k in data for k in required_params):
+        app.logger.warning(f"Missing required parameters for history API. Received: {data}")
+        return jsonify({"error": f"Missing required parameters for history API. Need {', '.join(required_params)}."}), 400
+    
     try:
-        data = request.json
-        
-        required_params = ["symbol", "resolution", "date_format", "range_from", "range_to"]
-        if not data or not all(k in data for k in required_params):
-            app.logger.warning(f"Missing required parameters for history API. Received: {data}")
-            return jsonify({"error": f"Missing required parameters for history API. Need {', '.join(required_params)}."}), 400
-        
-        # Ensure date_format is an integer as expected by the Fyers API
-        try:
-            data["date_format"] = int(data["date_format"])
-        except ValueError:
-            app.logger.warning(f"Invalid 'date_format' received: {data.get('date_format')}")
-            return jsonify({"error": "Invalid 'date_format'. Must be 0 or 1."}), 400
+        data["date_format"] = int(data["date_format"])
+    except ValueError:
+        app.logger.warning(f"Invalid 'date_format' received: {data.get('date_format')}")
+        return jsonify({"error": "Invalid 'date_format'. Must be 0 or 1."}), 400
 
-        # --- Logic to handle partial candles for epoch timestamps ---
-        if data["date_format"] == 0: # If using epoch timestamps
-            current_time = int(time.time())
-            requested_range_to = int(data["range_to"])
-            resolution = data["resolution"]
+    if data["date_format"] == 0:
+        current_time = int(time.time())
+        requested_range_to = int(data["range_to"])
+        resolution = data["resolution"]
 
-            resolution_in_seconds = 0
-            if resolution.endswith('S'): # Seconds resolutions
-                resolution_in_seconds = int(resolution[:-1])
-            elif resolution.isdigit(): # Minute resolutions
-                resolution_in_seconds = int(resolution) * 60
-            elif resolution in ["D", "1D"]: # Daily resolution
-                resolution_in_seconds = 24 * 60 * 60 
-            else:
-                app.logger.warning(f"Unsupported resolution format for partial candle adjustment: {resolution}")
+        resolution_in_seconds = 0
+        if resolution.endswith('S'):
+            resolution_in_seconds = int(resolution[:-1])
+        elif resolution.isdigit():
+            resolution_in_seconds = int(resolution) * 60
+        elif resolution in ["D", "1D"]:
+            resolution_in_seconds = 24 * 60 * 60 
+        else:
+            app.logger.warning(f"Unsupported resolution format for partial candle adjustment: {resolution}")
 
-            if resolution_in_seconds > 0:
-                current_resolution_start_epoch = (current_time // resolution_in_seconds) * resolution_in_seconds
-                
-                if requested_range_to >= current_resolution_start_epoch:
-                    adjusted_range_to_epoch = current_resolution_start_epoch - 1
-                    if adjusted_range_to_epoch < int(data["range_from"]):
-                        app.logger.info(f"Adjusted range_to ({adjusted_range_to_epoch}) is less than range_from ({data['range_from']}). No complete candles available for resolution {resolution} in this range after adjustment.")
-                        return jsonify({"candles": [], "s": "ok", "message": "No complete candles available for the adjusted range."})
-
-                    data["range_to"] = str(adjusted_range_to_epoch)
-                    app.logger.info(f"Adjusted 'range_to' for resolution '{resolution}' to ensure completed candles: {requested_range_to} -> {data['range_to']}")
+        if resolution_in_seconds > 0:
+            current_resolution_start_epoch = (current_time // resolution_in_seconds) * resolution_in_seconds
             
-        # --- End of partial candle logic ---
+            if requested_range_to >= current_resolution_start_epoch:
+                adjusted_range_to_epoch = current_resolution_start_epoch - 1
+                if adjusted_range_to_epoch < int(data["range_from"]):
+                    app.logger.info(f"Adjusted range_to ({adjusted_range_to_epoch}) is less than range_from ({data['range_from']}). No complete candles available for resolution {resolution} in this range after adjustment.")
+                    return jsonify({"candles": [], "s": "ok", "message": "No complete candles available for the adjusted range."})
 
-        if "cont_flag" in data:
-            data["cont_flag"] = int(data["cont_flag"])
-        if "oi_flag" in data:
-            data["oi_flag"] = int(data["oi_flag"])
+                data["range_to"] = str(adjusted_range_to_epoch)
+                app.logger.info(f"Adjusted 'range_to' for resolution '{resolution}' to ensure completed candles: {requested_range_to} -> {data['range_to']}")
+        
+    if "cont_flag" in data:
+        data["cont_flag"] = int(data["cont_flag"])
+    if "oi_flag" in data:
+        data["oi_flag"] = int(data["oi_flag"])
 
-        history_data = make_fyers_api_call(fyers_instance.history, data=data)
-        return jsonify(history_data)
-    except FyersException as e:
-        app.logger.error(f"Failed to fetch history with data {request.json}: {e}", exc_info=True)
-        return jsonify({"error": f"Failed to fetch history: {str(e)}"}), 500
-    except Exception as e:
-        app.logger.error(f"An unexpected error occurred while fetching history with data {request.json}: {e}", exc_info=True)
-        return jsonify({"error": f"An unexpected error occurred: {str(e)}"}), 500
+    result = make_fyers_api_call(fyers_instance.history, data=data)
+    if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], int):
+        return result
+    return jsonify(result)
 
 @app.route('/api/fyers/quotes', methods=['GET'])
 def get_quotes():
-    try:
-        symbols = request.args.get('symbols')
-        if not symbols:
-            app.logger.warning("Missing 'symbols' parameter for quotes API.")
-            return jsonify({"error": "Missing 'symbols' parameter. Eg: /api/fyers/quotes?symbols=NSE:SBIN-EQ,NSE:TCS-EQ"}), 400
-        
-        data = {"symbols": symbols}
-        quotes_data = make_fyers_api_call(fyers_instance.quotes, data=data)
-        return jsonify(quotes_data)
-    except FyersException as e:
-        app.logger.error(f"Failed to fetch quotes for symbols {request.args.get('symbols')}: {e}", exc_info=True)
-        return jsonify({"error": f"Failed to fetch quotes: {str(e)}"}), 500
-    except Exception as e:
-        app.logger.error(f"An unexpected error occurred while fetching quotes for symbols {request.args.get('symbols')}: {e}", exc_info=True)
-        return jsonify({"error": f"An unexpected error occurred: {str(e)}"}), 500
+    symbols = request.args.get('symbols')
+    if not symbols:
+        app.logger.warning("Missing 'symbols' parameter for quotes API.")
+        return jsonify({"error": "Missing 'symbols' parameter. Eg: /api/fyers/quotes?symbols=NSE:SBIN-EQ,NSE:TCS-EQ"}), 400
+    
+    data = {"symbols": symbols}
+    result = make_fyers_api_call(fyers_instance.quotes, data=data)
+    if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], int):
+        return result
+    return jsonify(result)
 
 @app.route('/api/fyers/market_depth', methods=['GET'])
 def get_market_depth():
-    try:
-        symbol = request.args.get('symbol')
-        ohlcv_flag = request.args.get('ohlcv_flag')
+    symbol = request.args.get('symbol')
+    ohlcv_flag = request.args.get('ohlcv_flag')
 
-        if not symbol or ohlcv_flag is None:
-            app.logger.warning(f"Missing 'symbol' or 'ohlcv_flag' parameter for market depth. Symbol: {symbol}, Flag: {ohlcv_flag}")
-            return jsonify({"error": "Missing 'symbol' or 'ohlcv_flag' parameter. Eg: /api/fyers/market_depth?symbol=NSE:SBIN-EQ&ohlcv_flag=1"}), 400
-        
-        try:
-            ohlcv_flag = int(ohlcv_flag)
-            if ohlcv_flag not in [0, 1]:
-                raise ValueError("ohlcv_flag must be 0 or 1.")
-        except ValueError as ve:
-            app.logger.warning(f"Invalid 'ohlcv_flag' received for market depth: {ohlcv_flag}")
-            return jsonify({"error": f"Invalid 'ohlcv_flag': {ve}"}), 400
-        
-        data = {
-            "symbol": symbol,
-            "ohlcv_flag": ohlcv_flag
-        }
-        market_depth_data = make_fyers_api_call(fyers_instance.depth, data=data)
-        return jsonify(market_depth_data)
-    except FyersException as e:
-        app.logger.error(f"Failed to fetch market depth for symbol {symbol}: {e}", exc_info=True)
-        return jsonify({"error": f"Failed to fetch market depth: {str(e)}"}), 500
-    except Exception as e:
-        app.logger.error(f"An unexpected error occurred while fetching market depth for symbol {symbol}: {e}", exc_info=True)
-        return jsonify({"error": f"An unexpected error occurred: {str(e)}"}), 500
+    if not symbol or ohlcv_flag is None:
+        app.logger.warning(f"Missing 'symbol' or 'ohlcv_flag' parameter for market depth. Symbol: {symbol}, Flag: {ohlcv_flag}")
+        return jsonify({"error": "Missing 'symbol' or 'ohlcv_flag' parameter. Eg: /api/fyers/market_depth?symbol=NSE:SBIN-EQ&ohlcv_flag=1"}), 400
+    
+    try:
+        ohlcv_flag = int(ohlcv_flag)
+        if ohlcv_flag not in [0, 1]:
+            raise ValueError("ohlcv_flag must be 0 or 1.")
+    except ValueError as ve:
+        app.logger.warning(f"Invalid 'ohlcv_flag' received for market depth: {ohlcv_flag}")
+        return jsonify({"error": f"Invalid 'ohlcv_flag': {ve}"}), 400
+    
+    data = {
+        "symbol": symbol,
+        "ohlcv_flag": ohlcv_flag
+    }
+    result = make_fyers_api_call(fyers_instance.depth, data=data)
+    if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], int):
+        return result
+    return jsonify(result)
 
 @app.route('/api/fyers/option_chain', methods=['GET'])
 def get_option_chain():
-    try:
-        symbol = request.args.get('symbol')
-        strikecount = request.args.get('strikecount')
+    symbol = request.args.get('symbol')
+    strikecount = request.args.get('strikecount')
 
-        if not symbol or not strikecount:
-            app.logger.warning(f"Missing 'symbol' or 'strikecount' parameter for option chain. Symbol: {symbol}, Strikecount: {strikecount}")
-            return jsonify({"error": "Missing 'symbol' or 'strikecount' parameter. Eg: /api/fyers/option_chain?symbol=NSE:TCS-EQ&strikecount=1"}), 400
-        
-        try:
-            strikecount = int(strikecount)
-            if not (1 <= strikecount <= 50):
-                app.logger.warning(f"Invalid 'strikecount' for option chain: {strikecount}. Must be between 1 and 50.")
-                return jsonify({"error": "'strikecount' must be between 1 and 50."}), 400
-        except ValueError:
-            app.logger.warning(f"Invalid 'strikecount' received for option chain: {strikecount}. Must be an integer.")
-            return jsonify({"error": "Invalid 'strikecount'. Must be an integer."}), 400
-        
-        data = {
-            "symbol": symbol,
-            "strikecount": strikecount
-        }
-        option_chain_data = make_fyers_api_call(fyers_instance.optionchain, data=data)
-        return jsonify(option_chain_data)
-    except FyersException as e:
-        app.logger.error(f"Failed to fetch option chain for symbol {symbol}: {e}", exc_info=True)
-        return jsonify({"error": f"Failed to fetch option chain: {str(e)}"}), 500
-    except Exception as e:
-        app.logger.error(f"An unexpected error occurred while fetching option chain for symbol {symbol}: {e}", exc_info=True)
-        return jsonify({"error": f"An unexpected error occurred: {str(e)}"}), 500
+    if not symbol or not strikecount:
+        app.logger.warning(f"Missing 'symbol' or 'strikecount' parameter for option chain. Symbol: {symbol}, Strikecount: {strikecount}")
+        return jsonify({"error": "Missing 'symbol' or 'strikecount' parameter. Eg: /api/fyers/option_chain?symbol=NSE:TCS-EQ&strikecount=1"}), 400
+    
+    try:
+        strikecount = int(strikecount)
+        if not (1 <= strikecount <= 50):
+            app.logger.warning(f"Invalid 'strikecount' for option chain: {strikecount}. Must be between 1 and 50.")
+            return jsonify({"error": "'strikecount' must be between 1 and 50."}), 400
+    except ValueError:
+        app.logger.warning(f"Invalid 'strikecount' received for option chain: {strikecount}. Must be an integer.")
+        return jsonify({"error": "Invalid 'strikecount'. Must be an integer."}), 400
+    
+    data = {
+        "symbol": symbol,
+        "strikecount": strikecount
+    }
+    result = make_fyers_api_call(fyers_instance.optionchain, data=data)
+    if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], int):
+        return result
+    return jsonify(result)
 
 @app.route('/api/fyers/news', methods=['GET'])
 def get_news():
@@ -435,20 +403,15 @@ def get_news():
 
 @app.route('/api/fyers/place_order', methods=['POST'])
 def place_single_order():
-    try:
-        order_data = request.json
-        if not order_data:
-            app.logger.warning("No order data provided for placing order.")
-            return jsonify({"error": "No order data provided."}), 400
-        
-        response = make_fyers_api_call(fyers_instance.place_order, order_data)
-        return jsonify(response)
-    except FyersException as e:
-        app.logger.error(f"Failed to place order with data {request.json}: {e}", exc_info=True)
-        return jsonify({"error": f"Failed to place order: {str(e)}"}), 500
-    except Exception as e:
-        app.logger.error(f"An unexpected error occurred while placing order with data {request.json}: {e}", exc_info=True)
-        return jsonify({"error": f"An unexpected error occurred: {str(e)}"}), 500
+    order_data = request.json
+    if not order_data:
+        app.logger.warning("No order data provided for placing order.")
+        return jsonify({"error": "No order data provided."}), 400
+    
+    result = make_fyers_api_call(fyers_instance.place_order, order_data)
+    if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], int):
+        return result
+    return jsonify(result)
 
 
 @app.route('/')
