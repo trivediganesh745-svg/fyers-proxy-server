@@ -162,9 +162,64 @@ def get_history():
             app.logger.warning(f"Invalid 'date_format' received: {data.get('date_format')}")
             return jsonify({"error": "Invalid 'date_format'. Must be 0 or 1."}), 400
 
+        # --- Logic to handle partial candles for epoch timestamps ---
+        if data["date_format"] == 0: # If using epoch timestamps
+            current_time = int(time.time())
+            requested_range_to = int(data["range_to"])
+            resolution = data["resolution"]
+
+            # Define resolution in seconds for calculation
+            resolution_in_seconds = 0
+            if resolution.endswith('S'): # Seconds resolutions
+                resolution_in_seconds = int(resolution[:-1])
+            elif resolution.isdigit(): # Minute resolutions
+                resolution_in_seconds = int(resolution) * 60
+            elif resolution in ["D", "1D"]: # Daily resolution
+                # Daily data is typically processed at day end, so usually doesn't need
+                # live adjustment for 'partial' daily candles in the same way as minutes/seconds.
+                # However, to be safe for intraday requests that happen to ask for 'today's' daily,
+                # we'll still adjust if range_to is current minute, though Fyers' daily might auto-handle.
+                resolution_in_seconds = 24 * 60 * 60 
+            else:
+                app.logger.warning(f"Unsupported resolution format for partial candle adjustment: {resolution}")
+                # Proceed without adjustment if resolution format is unknown for time calculation
+
+            if resolution_in_seconds > 0:
+                # Calculate the effective 'range_to' by subtracting one resolution period
+                # to ensure we get completed candles.
+                # Only adjust if the requested range_to is very close to or after the current time
+                # (meaning it might include the current, incomplete candle).
+                
+                # Check if the requested range_to is in the current (incomplete) resolution period
+                # or future.
+                # Example: If resolution is 60s (1 min), current_time is 12:10:20.
+                # We want range_to to be 12:09:59 (epoch for end of 12:09 candle).
+                # To get completed candles, new_range_to should be current_time - resolution_in_seconds - (current_time % resolution_in_seconds).
+                # Or simply: round down current_time to the nearest resolution boundary and then subtract one resolution.
+                
+                # Get the start of the current resolution period
+                current_resolution_start_epoch = (current_time // resolution_in_seconds) * resolution_in_seconds
+                
+                # If the requested range_to is at or after the start of the current resolution period
+                # (and thus potentially includes an incomplete candle), adjust it.
+                if requested_range_to >= current_resolution_start_epoch:
+                    adjusted_range_to_epoch = current_resolution_start_epoch - 1 # One second before the current period starts
+                    if adjusted_range_to_epoch < int(data["range_from"]):
+                        # If adjusting makes range_to less than range_from, it means we asked for
+                        # history up to the current incomplete candle, and after adjustment, there are no
+                        # complete candles in the requested window.
+                        app.logger.info(f"Adjusted range_to ({adjusted_range_to_epoch}) is less than range_from ({data['range_from']}). No complete candles available for resolution {resolution} in this range after adjustment.")
+                        return jsonify({"candles": [], "s": "ok", "message": "No complete candles available for the adjusted range."})
+
+                    data["range_to"] = str(adjusted_range_to_epoch)
+                    app.logger.info(f"Adjusted 'range_to' for resolution '{resolution}' to ensure completed candles: {requested_range_to} -> {data['range_to']}")
+            
+        # --- End of partial candle logic ---
+
         # Handle 'cont_flag' and 'oi_flag' if present, otherwise set defaults or omit
         if "cont_flag" in data:
             data["cont_flag"] = int(data["cont_flag"])
+        # Only include oi_flag if it's explicitly set in the request, or Fyers might return an error
         if "oi_flag" in data:
             data["oi_flag"] = int(data["oi_flag"])
 
