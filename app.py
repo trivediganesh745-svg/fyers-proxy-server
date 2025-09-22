@@ -2,7 +2,9 @@ import os
 from flask import Flask, request, jsonify, redirect, url_for
 from fyers_apiv3 import fyersModel
 from dotenv import load_dotenv
-from flask_cors import CORS # For handling CORS with your frontend
+from flask_cors import CORS
+import datetime
+import time
 
 # Load environment variables from .env file (for local development)
 load_dotenv()
@@ -14,8 +16,6 @@ CORS(app) # Enable CORS for all routes
 CLIENT_ID = os.environ.get("FYERS_CLIENT_ID")
 SECRET_KEY = os.environ.get("FYERS_SECRET_KEY")
 REDIRECT_URI = os.environ.get("FYERS_REDIRECT_URI") # This should be your Render proxy URL, e.g., "https://your-render-app.onrender.com/fyers-auth-callback"
-# The initial access token will be set manually as an environment variable
-# For automated refresh, you'd extend this logic.
 ACCESS_TOKEN = os.environ.get("FYERS_ACCESS_TOKEN")
 
 if not all([CLIENT_ID, SECRET_KEY, REDIRECT_URI]):
@@ -100,7 +100,7 @@ def fyers_auth_callback():
         return jsonify({"error": f"Failed to generate Fyers access token: {str(e)}"}), 500
 
 
-# --- Fyers Data Endpoints (example) ---
+# --- Fyers Data Endpoints ---
 
 @app.route('/api/fyers/profile')
 def get_profile():
@@ -132,21 +132,106 @@ def get_holdings():
     except Exception as e:
         return jsonify({"error": f"Failed to fetch holdings: {str(e)}"}), 500
 
-# You can add more endpoints for other Fyers API calls (tradebook, orderbook, positions, etc.)
-# For example, for history:
 @app.route('/api/fyers/history', methods=['POST'])
 def get_history():
     if not fyers:
         return jsonify({"error": "Fyers API not initialized. Please authenticate first."}), 401
     try:
         data = request.json
-        if not data or not all(k in data for k in ["symbol", "resolution", "range_from", "range_to"]):
-            return jsonify({"error": "Missing required parameters for history API. Need symbol, resolution, range_from, range_to."}), 400
         
+        required_params = ["symbol", "resolution", "date_format", "range_from", "range_to"]
+        if not data or not all(k in data for k in required_params):
+            return jsonify({"error": f"Missing required parameters for history API. Need {', '.join(required_params)}."}), 400
+        
+        # Ensure date_format is an integer as expected by the Fyers API
+        try:
+            data["date_format"] = int(data["date_format"])
+        except ValueError:
+            return jsonify({"error": "Invalid 'date_format'. Must be 0 or 1."}), 400
+
+        # Handle 'cont_flag' and 'oi_flag' if present, otherwise set defaults or omit
+        if "cont_flag" in data:
+            data["cont_flag"] = int(data["cont_flag"])
+        if "oi_flag" in data:
+            data["oi_flag"] = int(data["oi_flag"])
+
         history_data = fyers.history(data)
         return jsonify(history_data)
     except Exception as e:
         return jsonify({"error": f"Failed to fetch history: {str(e)}"}), 500
+
+@app.route('/api/fyers/quotes', methods=['GET'])
+def get_quotes():
+    if not fyers:
+        return jsonify({"error": "Fyers API not initialized. Please authenticate first."}), 401
+    try:
+        symbols = request.args.get('symbols')
+        if not symbols:
+            return jsonify({"error": "Missing 'symbols' parameter. Eg: /api/fyers/quotes?symbols=NSE:SBIN-EQ,NSE:TCS-EQ"}), 400
+        
+        data = {"symbols": symbols} # Fyers API expects a dict with 'symbols' key
+        quotes_data = fyers.quotes(data=data)
+        return jsonify(quotes_data)
+    except Exception as e:
+        return jsonify({"error": f"Failed to fetch quotes: {str(e)}"}), 500
+
+@app.route('/api/fyers/market_depth', methods=['GET'])
+def get_market_depth():
+    if not fyers:
+        return jsonify({"error": "Fyers API not initialized. Please authenticate first."}), 401
+    try:
+        symbol = request.args.get('symbol')
+        ohlcv_flag = request.args.get('ohlcv_flag') # It's an int: 0 or 1
+
+        if not symbol or ohlcv_flag is None:
+            return jsonify({"error": "Missing 'symbol' or 'ohlcv_flag' parameter. Eg: /api/fyers/market_depth?symbol=NSE:SBIN-EQ&ohlcv_flag=1"}), 400
+        
+        try:
+            ohlcv_flag = int(ohlcv_flag)
+            if ohlcv_flag not in [0, 1]:
+                raise ValueError("ohlcv_flag must be 0 or 1.")
+        except ValueError as ve:
+            return jsonify({"error": f"Invalid 'ohlcv_flag': {ve}"}), 400
+        
+        data = {
+            "symbol": symbol,
+            "ohlcv_flag": ohlcv_flag
+        }
+        market_depth_data = fyers.market_depth(data=data)
+        return jsonify(market_depth_data)
+    except Exception as e:
+        return jsonify({"error": f"Failed to fetch market depth: {str(e)}"}), 500
+
+@app.route('/api/fyers/option_chain', methods=['GET'])
+def get_option_chain():
+    if not fyers:
+        return jsonify({"error": "Fyers API not initialized. Please authenticate first."}), 401
+    try:
+        symbol = request.args.get('symbol')
+        strikecount = request.args.get('strikecount')
+        timestamp = request.args.get('timestamp') # Optional
+
+        if not symbol or not strikecount:
+            return jsonify({"error": "Missing 'symbol' or 'strikecount' parameter. Eg: /api/fyers/option_chain?symbol=NSE:TCS-EQ&strikecount=1"}), 400
+        
+        try:
+            strikecount = int(strikecount)
+            if not (1 <= strikecount <= 50):
+                return jsonify({"error": "'strikecount' must be between 1 and 50."}), 400
+        except ValueError:
+            return jsonify({"error": "Invalid 'strikecount'. Must be an integer."}), 400
+        
+        data = {
+            "symbol": symbol,
+            "strikecount": strikecount
+        }
+        if timestamp:
+            data["timestamp"] = timestamp # Add timestamp if provided
+
+        option_chain_data = fyers.option_chain(data=data)
+        return jsonify(option_chain_data)
+    except Exception as e:
+        return jsonify({"error": f"Failed to fetch option chain: {str(e)}"}), 500
 
 # Example for placing an order (requires POST request with order data)
 @app.route('/api/fyers/place_order', methods=['POST'])
@@ -166,7 +251,7 @@ def place_single_order():
 
 @app.route('/')
 def home():
-    return "Fyers API Proxy Server is running!"
+    return "Fyers API Proxy Server is running! Use /fyers-login to authenticate."
 
 
 if __name__ == '__main__':
