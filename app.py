@@ -32,6 +32,7 @@ fyers_instance = None # Renamed to avoid conflict with fyersModel class
 def initialize_fyers_model(token):
     global fyers_instance
     if token:
+        # Ensure client_id is passed during initialization for operations that might require it
         fyers_instance = fyersModel.FyersModel(token=token, is_async=False, client_id=CLIENT_ID, log_path="")
         app.logger.info("FyersModel initialized with access token.")
     else:
@@ -228,7 +229,9 @@ def get_option_chain():
     try:
         symbol = request.args.get('symbol')
         strikecount = request.args.get('strikecount')
-        timestamp = request.args.get('timestamp') # Optional
+        # The timestamp parameter is not part of the current Fyers API v3 docs for option chain directly.
+        # If Fyers adds it or a different endpoint uses it, uncomment and adapt.
+        # timestamp = request.args.get('timestamp') # Optional
 
         if not symbol or not strikecount:
             app.logger.warning(f"Missing 'symbol' or 'strikecount' parameter for option chain. Symbol: {symbol}, Strikecount: {strikecount}")
@@ -236,7 +239,7 @@ def get_option_chain():
         
         try:
             strikecount = int(strikecount)
-            if not (1 <= strikecount <= 50):
+            if not (1 <= strikecount <= 50): # Fyers API v3 docs typically limit strikecount
                 app.logger.warning(f"Invalid 'strikecount' for option chain: {strikecount}. Must be between 1 and 50.")
                 return jsonify({"error": "'strikecount' must be between 1 and 50."}), 400
         except ValueError:
@@ -247,16 +250,46 @@ def get_option_chain():
             "symbol": symbol,
             "strikecount": strikecount
         }
-        if timestamp:
-            data["timestamp"] = timestamp # Add timestamp if provided
+        # If timestamp parameter becomes relevant for option chain, add it here:
+        # if timestamp:
+        #     data["timestamp"] = timestamp 
 
-        # Corrected method name: 'optionchain' instead of 'option_chain'
+        # Corrected method name: 'optionchain' instead of 'option_chain' as per fyers_apiv3 library
         option_chain_data = fyers_instance.optionchain(data=data)
         
+        # The Fyers API response for option chain already includes 'volume' if available.
+        # No explicit modification is needed here, just ensure the data is passed through.
         return jsonify(option_chain_data)
     except Exception as e:
         app.logger.error(f"Failed to fetch option chain for symbol {symbol}: {e}", exc_info=True)
         return jsonify({"error": f"Failed to fetch option chain: {str(e)}"}), 500
+
+# Endpoint to conceptually provide news updates
+@app.route('/api/fyers/news', methods=['GET'])
+def get_news():
+    """
+    Provides a placeholder for Fyers-related news updates.
+    NOTE: Fyers API v3 does not directly expose a "news feed" endpoint
+    that can be easily integrated like other data endpoints (profile, funds, etc.).
+    To get actual news, you would need to:
+    1. Integrate a dedicated financial news API (e.g., NewsAPI, Alpha Vantage).
+    2. Implement web scraping for Fyers' own news sections (be mindful of terms of service).
+    3. Explore Fyers' market data streaming APIs for potential news headlines.
+    """
+    app.logger.info("Accessing placeholder news endpoint.")
+    
+    # This is static placeholder data. Replace with actual news integration if possible.
+    news_headlines = [
+        {"id": 1, "title": "Market sentiments positive on Q1 earnings", "source": "Fyers Internal Analysis", "timestamp": str(datetime.datetime.now())},
+        {"id": 2, "title": "RBI holds interest rates steady", "source": "Economic Times", "timestamp": str(datetime.datetime.now() - datetime.timedelta(hours=2))},
+        {"id": 3, "title": "Tech stocks lead the rally", "source": "Reuters", "timestamp": str(datetime.datetime.now() - datetime.timedelta(days=1))},
+        {"id": 4, "title": "F&O expiry expected to be volatile", "source": "Fyers Blog", "timestamp": str(datetime.datetime.now() - datetime.timedelta(days=1, hours=4))}
+    ]
+    return jsonify({
+        "message": "This is a placeholder for Fyers news. Actual integration requires a dedicated news API or scraping.",
+        "news": news_headlines
+    })
+
 
 # Example for placing an order (requires POST request with order data)
 @app.route('/api/fyers/place_order', methods=['POST'])
@@ -278,7 +311,7 @@ def place_single_order():
 
 @app.route('/')
 def home():
-    return "Fyers API Proxy Server is running! Use /fyers-login to authenticate."
+    return "Fyers API Proxy Server is running! Use /fyers-login to authenticate or /api/fyers/news for news (placeholder)."
 
 
 if __name__ == '__main__':
