@@ -214,7 +214,8 @@ def get_market_depth():
             "symbol": symbol,
             "ohlcv_flag": ohlcv_flag
         }
-        market_depth_data = fyers_instance.market_depth(data=data)
+        # The Fyers API method is 'depth', not 'market_depth'
+        market_depth_data = fyers_instance.depth(data=data)
         return jsonify(market_depth_data)
     except Exception as e:
         app.logger.error(f"Failed to fetch market depth for symbol {symbol}: {e}", exc_info=True)
@@ -249,9 +250,8 @@ def get_option_chain():
         if timestamp:
             data["timestamp"] = timestamp # Add timestamp if provided
 
-        # The core change as per analysis:
-        # The FyersModel.option_chain method expects the 'data' dictionary directly.
-        option_chain_data = fyers_instance.option_chain(data=data)
+        # Corrected method name: 'optionchain' instead of 'option_chain'
+        option_chain_data = fyers_instance.optionchain(data=data)
         
         return jsonify(option_chain_data)
     except Exception as e:
