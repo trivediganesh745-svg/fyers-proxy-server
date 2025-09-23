@@ -10,6 +10,11 @@ import time
 import logging
 import json
 
+# --- ADDED FOR GEMINI AI ---
+import google.generativeai as genai
+# --- END ADDED FOR GEMINI AI ---
+
+
 # Load environment variables from .env file (for local development)
 load_dotenv()
 
@@ -35,7 +40,7 @@ if not all([CLIENT_ID, SECRET_KEY, REDIRECT_URI]):
     # sys.exit(1) # Uncomment if you want the app to stop on missing essentials
 
 # Initialize FyersModel (will be re-initialized with an access token after login or refresh)
-fyers_instance = None 
+fyers_instance = None
 
 # --- Persistent Storage Placeholder ---
 # In a real application, you would save/load tokens from a database, file,
@@ -47,13 +52,13 @@ def store_tokens(access_token, refresh_token):
     global ACCESS_TOKEN, REFRESH_TOKEN
     ACCESS_TOKEN = access_token
     REFRESH_TOKEN = refresh_token
-    
+
     # In a real app, write these to a file or database.
     # For demonstration, we'll print them.
     app.logger.info("Tokens updated. For persistence, save these securely:")
     app.logger.info(f"New Access Token: {ACCESS_TOKEN}")
     app.logger.info(f"New Refresh Token: {REFRESH_TOKEN}")
-    
+
     # Example of saving to a file (simple, but not recommended for production security)
     # with open("tokens.json", "w") as f:
     #     json.dump({"access_token": access_token, "refresh_token": refresh_token}, f)
@@ -77,7 +82,7 @@ load_tokens()
 
 def initialize_fyers_model(token=None):
     global fyers_instance, ACCESS_TOKEN, REFRESH_TOKEN
-    
+
     # Prioritize provided token, then global ACCESS_TOKEN
     token_to_use = token if token else ACCESS_TOKEN
 
@@ -108,7 +113,7 @@ def refresh_access_token():
         client_id=CLIENT_ID,
         redirect_uri=REDIRECT_URI,
         response_type="code", # Even for refresh token, this is part of SessionModel init
-        state="refresh_state", 
+        state="refresh_state",
         secret_key=SECRET_KEY,
         grant_type="refresh_token" # This is the key for refreshing
     )
@@ -117,11 +122,11 @@ def refresh_access_token():
     try:
         app.logger.info(f"Attempting to refresh access token using refresh token: {REFRESH_TOKEN[:5]}...")
         response = session.generate_token()
-        
+
         if response and response.get("s") == "ok":
             new_access_token = response["access_token"]
             new_refresh_token = response.get("refresh_token", REFRESH_TOKEN) # Fyers might issue new refresh token, or keep old
-            
+
             store_tokens(new_access_token, new_refresh_token)
             initialize_fyers_model(new_access_token) # Re-initialize Fyers model with new access token
             app.logger.info("Access token refreshed successfully.")
@@ -135,6 +140,22 @@ def refresh_access_token():
 
 # Initialize Fyers model at startup
 initialize_fyers_model()
+
+# --- Gemini AI Configuration ---
+# Configure Gemini API
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY") # Get from Render environment variables
+gemini_model = None # Initialize as None
+
+if GEMINI_API_KEY:
+    try:
+        genai.configure(api_key=GEMINI_API_KEY)
+        gemini_model = genai.GenerativeModel('gemini-pro') # You can also use 'gemini-1.5-flash', 'gemini-1.5-pro'
+        app.logger.info("Gemini AI model configured.")
+    except Exception as e:
+        app.logger.error(f"Error configuring Gemini AI: {e}", exc_info=True)
+        app.logger.warning("Gemini AI functionality might be unavailable due to configuration error.")
+else:
+    app.logger.warning("GEMINI_API_KEY not set. Gemini AI functionality will be unavailable.")
 
 # --- Fyers Authentication Flow Endpoints ---
 
@@ -188,23 +209,29 @@ def fyers_auth_callback():
     session.set_token(auth_code)
     try:
         response = session.generate_token()
-        
+
         if response and response.get("s") == "ok":
             new_access_token = response["access_token"]
             new_refresh_token = response["refresh_token"] # Get the refresh token here
-            
+
             store_tokens(new_access_token, new_refresh_token) # Store both tokens
             initialize_fyers_model(new_access_token) # Re-initialize with the new access token
-            
+
             app.logger.info("Fyers tokens generated successfully!")
-            return jsonify({"message": "Fyers tokens generated successfully!", "access_token_available": True})
+            # Redirect back to the frontend with a success parameter
+            # IMPORTANT: Replace with your actual frontend URL if hosted
+            # This makes the frontend know authentication succeeded.
+            frontend_success_url = os.environ.get("FRONTEND_URL", "http://localhost:8000") # Default for local testing
+            return redirect(f"{frontend_success_url}?message=Fyers+tokens+generated+successfully&access_token_available=True")
         else:
             app.logger.error(f"Failed to generate Fyers tokens. Response: {response}")
-            return jsonify({"error": f"Failed to generate Fyers tokens. Response: {response}"}), 500
-        
+            frontend_error_url = os.environ.get("FRONTEND_URL", "http://localhost:8000")
+            return redirect(f"{frontend_error_url}?error=Fyers+authentication+failed&details={response.get('message', 'Unknown error')}")
+
     except Exception as e:
         app.logger.error(f"Error generating Fyers access token: {e}", exc_info=True)
-        return jsonify({"error": f"Failed to generate Fyers access token: {str(e)}"}), 500
+        frontend_error_url = os.environ.get("FRONTEND_URL", "http://localhost:8000")
+        return redirect(f"{frontend_error_url}?error=Fyers+authentication+failed&details={str(e)}")
 
 
 # --- Fyers Data Endpoints with Token Refresh Logic ---
@@ -226,7 +253,7 @@ def make_fyers_api_call(api_method, *args, **kwargs):
         # You might need to inspect the 'e' object directly to see if it contains
         # a response dict or specific error codes from Fyers.
         # Example: if hasattr(e, 'response') and e.response.get('code') == -100:
-        
+
         # Check for keywords that indicate token issues
         if "token" in error_message or "authenticated" in error_message or "login" in error_message or "invalid_access_token" in error_message:
             app.logger.warning(f"Access token expired or invalid. Attempting to refresh. Original error: {e}")
@@ -270,12 +297,12 @@ def get_holdings():
 @app.route('/api/fyers/history', methods=['POST'])
 def get_history():
     data = request.json
-    
+
     required_params = ["symbol", "resolution", "date_format", "range_from", "range_to"]
     if not data or not all(k in data for k in required_params):
         app.logger.warning(f"Missing required parameters for history API. Received: {data}")
         return jsonify({"error": f"Missing required parameters for history API. Need {', '.join(required_params)}."}), 400
-    
+
     try:
         data["date_format"] = int(data["date_format"])
     except ValueError:
@@ -293,13 +320,13 @@ def get_history():
         elif resolution.isdigit():
             resolution_in_seconds = int(resolution) * 60
         elif resolution in ["D", "1D"]:
-            resolution_in_seconds = 24 * 60 * 60 
+            resolution_in_seconds = 24 * 60 * 60
         else:
             app.logger.warning(f"Unsupported resolution format for partial candle adjustment: {resolution}")
 
         if resolution_in_seconds > 0:
             current_resolution_start_epoch = (current_time // resolution_in_seconds) * resolution_in_seconds
-            
+
             if requested_range_to >= current_resolution_start_epoch:
                 adjusted_range_to_epoch = current_resolution_start_epoch - 1
                 if adjusted_range_to_epoch < int(data["range_from"]):
@@ -308,7 +335,7 @@ def get_history():
 
                 data["range_to"] = str(adjusted_range_to_epoch)
                 app.logger.info(f"Adjusted 'range_to' for resolution '{resolution}' to ensure completed candles: {requested_range_to} -> {data['range_to']}")
-        
+
     if "cont_flag" in data:
         data["cont_flag"] = int(data["cont_flag"])
     if "oi_flag" in data:
@@ -325,7 +352,7 @@ def get_quotes():
     if not symbols:
         app.logger.warning("Missing 'symbols' parameter for quotes API.")
         return jsonify({"error": "Missing 'symbols' parameter. Eg: /api/fyers/quotes?symbols=NSE:SBIN-EQ,NSE:TCS-EQ"}), 400
-    
+
     data = {"symbols": symbols}
     result = make_fyers_api_call(fyers_instance.quotes, data=data)
     if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], int):
@@ -340,7 +367,7 @@ def get_market_depth():
     if not symbol or ohlcv_flag is None:
         app.logger.warning(f"Missing 'symbol' or 'ohlcv_flag' parameter for market depth. Symbol: {symbol}, Flag: {ohlcv_flag}")
         return jsonify({"error": "Missing 'symbol' or 'ohlcv_flag' parameter. Eg: /api/fyers/market_depth?symbol=NSE:SBIN-EQ&ohlcv_flag=1"}), 400
-    
+
     try:
         ohlcv_flag = int(ohlcv_flag)
         if ohlcv_flag not in [0, 1]:
@@ -348,7 +375,7 @@ def get_market_depth():
     except ValueError as ve:
         app.logger.warning(f"Invalid 'ohlcv_flag' received for market depth: {ohlcv_flag}")
         return jsonify({"error": f"Invalid 'ohlcv_flag': {ve}"}), 400
-    
+
     data = {
         "symbol": symbol,
         "ohlcv_flag": ohlcv_flag
@@ -366,7 +393,7 @@ def get_option_chain():
     if not symbol or not strikecount:
         app.logger.warning(f"Missing 'symbol' or 'strikecount' parameter for option chain. Symbol: {symbol}, Strikecount: {strikecount}")
         return jsonify({"error": "Missing 'symbol' or 'strikecount' parameter. Eg: /api/fyers/option_chain?symbol=NSE:TCS-EQ&strikecount=1"}), 400
-    
+
     try:
         strikecount = int(strikecount)
         if not (1 <= strikecount <= 50):
@@ -375,7 +402,7 @@ def get_option_chain():
     except ValueError:
         app.logger.warning(f"Invalid 'strikecount' received for option chain: {strikecount}. Must be an integer.")
         return jsonify({"error": "Invalid 'strikecount'. Must be an integer."}), 400
-    
+
     data = {
         "symbol": symbol,
         "strikecount": strikecount
@@ -388,7 +415,7 @@ def get_option_chain():
 @app.route('/api/fyers/news', methods=['GET'])
 def get_news():
     app.logger.info("Accessing placeholder news endpoint.")
-    
+
     news_headlines = [
         {"id": 1, "title": "Market sentiments positive on Q1 earnings", "source": "Fyers Internal Analysis", "timestamp": str(datetime.datetime.now())},
         {"id": 2, "title": "RBI holds interest rates steady", "source": "Economic Times", "timestamp": str(datetime.datetime.now() - datetime.timedelta(hours=2))},
@@ -407,17 +434,56 @@ def place_single_order():
     if not order_data:
         app.logger.warning("No order data provided for placing order.")
         return jsonify({"error": "No order data provided."}), 400
-    
+
     result = make_fyers_api_call(fyers_instance.place_order, order_data)
     if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], int):
         return result
     return jsonify(result)
 
+# --- NEW GEMINI AI ENDPOINT ---
+@app.route('/api/gemini/analyze', methods=['POST'])
+def analyze_with_gemini():
+    if not gemini_model:
+        return jsonify({"error": "Gemini AI is not configured on the server."}), 503
+
+    data = request.json
+    user_prompt = data.get('prompt')
+    fyers_data = data.get('fyers_data', 'No Fyers data provided.')
+
+    if not user_prompt:
+        return jsonify({"error": "Missing 'prompt' in request."}), 400
+
+    # Sanitize or limit fyers_data size if it could be excessively large
+    # For very large datasets, consider summarizing them before sending to Gemini
+    # Or implement a streaming approach, but for now, direct string is fine.
+
+    combined_prompt = f"You are an AI assistant analyzing financial data. Here is some Fyers data:\n\n{fyers_data}\n\nUser's request: {user_prompt}\n\nBased on the provided Fyers data and the user's request, provide a concise and actionable analysis. If specific data for the request is not present, state that."
+
+    try:
+        app.logger.info(f"Sending prompt to Gemini AI. Prompt length: {len(combined_prompt)} chars.")
+        # Adjust generation config if needed (e.g., temperature, max_output_tokens)
+        response = gemini_model.generate_content(combined_prompt)
+        app.logger.info("Received response from Gemini AI.")
+        return jsonify({"analysis": response.text})
+    except genai.types.BlockedPromptException as e:
+        app.logger.error(f"Gemini AI blocked prompt: {e.response.prompt_feedback.block_reason}", exc_info=True)
+        return jsonify({"error": f"AI analysis blocked: {e.response.prompt_feedback.block_reason}. Please revise your prompt."}), 400
+    except Exception as e:
+        app.logger.error(f"Error calling Gemini AI: {e}", exc_info=True)
+        return jsonify({"error": f"Error during AI analysis: {str(e)}"}), 500
+
 
 @app.route('/')
 def home():
-    return "Fyers API Proxy Server is running! Use /fyers-login to authenticate or /api/fyers/news for news (placeholder)."
+    # Render's default root needs to return something.
+    # You could redirect to an external frontend URL here if your frontend is hosted separately
+    # and not just run locally.
+    frontend_url = os.environ.get("FRONTEND_URL", "http://localhost:8000") # Default for local testing
+    return f"Fyers API Proxy Server is running! Access the frontend at <a href='{frontend_url}'>{frontend_url}</a>. Use /fyers-login to authenticate or /api/fyers/news for news (placeholder)."
 
 
 if __name__ == '__main__':
+    # For local testing, ensure you have a .env file with FYERS_CLIENT_ID, etc.
+    # and also GEMINI_API_KEY if you're testing Gemini locally.
+    # Also, set FRONTEND_URL to where your index.html is served if not default.
     app.run(host='0.0.0.0', port=5000)
