@@ -1,21 +1,16 @@
 import os
-from flask import Flask, request, jsonify, redirect, url_for, render_template_string
+from flask import Flask, request, jsonify, redirect, url_for
 from fyers_apiv3 import fyersModel
+# Remove the problematic import:
+# from fyers_apiv3.fyersModel import FyersException # Assuming this exception exists
 from dotenv import load_dotenv
 from flask_cors import CORS
 import datetime
 import time
 import logging
 import json
-import sys # Added for sys.exit
-import requests # Added for market cues placeholders, if you decide to implement real external calls later
-
-# --- ADDED FOR GEMINI AI ---
-import google.generativeai as genai
-# --- END ADDED FOR GEMINI AI ---
 
 # Load environment variables from .env file (for local development)
-# This will be ignored by Render in production as it uses environment variables directly.
 load_dotenv()
 
 app = Flask(__name__)
@@ -28,50 +23,46 @@ app.logger.setLevel(logging.INFO)
 # --- Fyers API Configuration (from environment variables) ---
 CLIENT_ID = os.environ.get("FYERS_CLIENT_ID")
 SECRET_KEY = os.environ.get("FYERS_SECRET_KEY")
-REDIRECT_URI = os.environ.get("FYERS_REDIRECT_URI") # This should point to your Render callback URL, e.g., https://fyers-proxy-server.onrender.com/fyers-auth-callback
-# This is CRITICAL for the callback redirect to your frontend
-FRONTEND_URL = os.environ.get("FRONTEND_URL") # e.g., https://your-github-username.github.io/your-frontend-repo/
-
+REDIRECT_URI = os.environ.get("FYERS_REDIRECT_URI")
 # These will be updated dynamically and potentially saved persistently
 ACCESS_TOKEN = os.environ.get("FYERS_ACCESS_TOKEN")
 REFRESH_TOKEN = os.environ.get("FYERS_REFRESH_TOKEN")
 
-if not all([CLIENT_ID, SECRET_KEY, REDIRECT_URI, FRONTEND_URL]):
-    app.logger.error("ERROR: Essential environment variables (FYERS_CLIENT_ID, FYERS_SECRET_KEY, FYERS_REDIRECT_URI, FRONTEND_URL) are not fully set. Please check your Render environment variables.")
-    # In a real production app, you might want to handle this more gracefully than sys.exit(1)
-    # but for a critical dependency, exiting early can prevent further errors.
-    sys.exit(1) # Exit if core functionality won't work
+if not all([CLIENT_ID, SECRET_KEY, REDIRECT_URI]):
+    app.logger.error("ERROR: Fyers API credentials (CLIENT_ID, SECRET_KEY, REDIRECT_URI) are not fully set. Please check your .env file or environment variables.")
+    # Exit or raise error, as core functionality won't work
+    # For a web app, you might want to return a user-friendly error page/message
+    # sys.exit(1) # Uncomment if you want the app to stop on missing essentials
 
 # Initialize FyersModel (will be re-initialized with an access token after login or refresh)
-fyers_instance = None
+fyers_instance = None 
 
 # --- Persistent Storage Placeholder ---
 # In a real application, you would save/load tokens from a database, file,
 # or a more secure key-value store. For this example, we'll simulate it
 # by updating the global variables, but this is NOT persistent across server restarts.
-# For Render, environment variables are loaded at startup. For persistent tokens
-# beyond a single deploy/restart, you'd need a proper database or a more advanced
-# state management (e.g., Redis). For this setup, the frontend will trigger a re-login
-# if tokens on the backend are lost (e.g., after a Render redeploy).
+# For production, consider using Redis, a simple JSON file, or a proper DB.
 
-# IMPORTANT: For true persistence on Render without a database, you would need
-# to save these to a writeable volume or re-authenticate on every new instance.
-# For simplicity, this example treats Render restarts as a token reset.
-# The store_tokens and load_tokens functions here primarily manage global variables
-# within the running instance of the Flask app.
 def store_tokens(access_token, refresh_token):
     global ACCESS_TOKEN, REFRESH_TOKEN
     ACCESS_TOKEN = access_token
     REFRESH_TOKEN = refresh_token
+    
     # In a real app, write these to a file or database.
-    app.logger.info("Tokens updated. For persistence, save these securely in a database/file.")
-    app.logger.info(f"New Access Token: {ACCESS_TOKEN[:10]}...") # Log partial token
-    app.logger.info(f"New Refresh Token: {REFRESH_TOKEN[:10]}...") # Log partial token
+    # For demonstration, we'll print them.
+    app.logger.info("Tokens updated. For persistence, save these securely:")
+    app.logger.info(f"New Access Token: {ACCESS_TOKEN}")
+    app.logger.info(f"New Refresh Token: {REFRESH_TOKEN}")
+    
+    # Example of saving to a file (simple, but not recommended for production security)
+    # with open("tokens.json", "w") as f:
+    #     json.dump({"access_token": access_token, "refresh_token": refresh_token}, f)
 
 def load_tokens():
     global ACCESS_TOKEN, REFRESH_TOKEN
-    # In this Render setup, initial tokens come from environment variables.
-    # If using a file for persistence:
+    # In a real app, load from your persistent storage
+    # For this example, we're loading from environment variables at startup.
+    # If using a file:
     # try:
     #     with open("tokens.json", "r") as f:
     #         data = json.load(f)
@@ -79,14 +70,15 @@ def load_tokens():
     #         REFRESH_TOKEN = data.get("refresh_token")
     # except FileNotFoundError:
     #     app.logger.info("tokens.json not found, starting fresh.")
-    #     pass
-    pass # For Render, we rely on env vars at startup, or store_tokens updating globals
+    pass
 
-# Load tokens at startup (from env vars if set)
+# Load tokens at startup
 load_tokens()
 
 def initialize_fyers_model(token=None):
     global fyers_instance, ACCESS_TOKEN, REFRESH_TOKEN
+    
+    # Prioritize provided token, then global ACCESS_TOKEN
     token_to_use = token if token else ACCESS_TOKEN
 
     if token_to_use:
@@ -95,6 +87,7 @@ def initialize_fyers_model(token=None):
         return True
     elif REFRESH_TOKEN and CLIENT_ID and SECRET_KEY:
         app.logger.info("No access token provided or found, attempting to use refresh token.")
+        # Attempt to refresh using the refresh token
         if refresh_access_token():
             app.logger.info("FyersModel initialized with refreshed access token.")
             return True
@@ -114,24 +107,23 @@ def refresh_access_token():
     session = fyersModel.SessionModel(
         client_id=CLIENT_ID,
         redirect_uri=REDIRECT_URI,
-        response_type="code",
-        state="refresh_state", # State can be anything for refresh token flow
+        response_type="code", # Even for refresh token, this is part of SessionModel init
+        state="refresh_state", 
         secret_key=SECRET_KEY,
-        grant_type="refresh_token"
+        grant_type="refresh_token" # This is the key for refreshing
     )
-    session.set_token(REFRESH_TOKEN)
+    session.set_token(REFRESH_TOKEN) # Set the refresh token
 
     try:
         app.logger.info(f"Attempting to refresh access token using refresh token: {REFRESH_TOKEN[:5]}...")
         response = session.generate_token()
-
+        
         if response and response.get("s") == "ok":
             new_access_token = response["access_token"]
-            # Fyers API might not always return a new refresh token with every refresh.
-            # Use the existing one if a new one isn't provided.
-            new_refresh_token = response.get("refresh_token", REFRESH_TOKEN)
+            new_refresh_token = response.get("refresh_token", REFRESH_TOKEN) # Fyers might issue new refresh token, or keep old
+            
             store_tokens(new_access_token, new_refresh_token)
-            initialize_fyers_model(new_access_token)
+            initialize_fyers_model(new_access_token) # Re-initialize Fyers model with new access token
             app.logger.info("Access token refreshed successfully.")
             return True
         else:
@@ -144,24 +136,8 @@ def refresh_access_token():
 # Initialize Fyers model at startup
 initialize_fyers_model()
 
-# --- Gemini AI Configuration ---
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY") # Get from Render environment variables
-gemini_model = None # Initialize as None
-
-if GEMINI_API_KEY:
-    try:
-        genai.configure(api_key=GEMINI_API_KEY)
-        # Using a more robust model name. 'gemini-pro' is a good default.
-        # Consider 'gemini-1.5-flash' or 'gemini-1.5-pro' if available and needed.
-        gemini_model = genai.GenerativeModel('gemini-pro')
-        app.logger.info("Gemini AI model configured.")
-    except Exception as e:
-        app.logger.error(f"Error configuring Gemini AI: {e}", exc_info=True)
-        app.logger.warning("Gemini AI functionality might be unavailable due to configuration error.")
-else:
-    app.logger.warning("GEMINI_API_KEY not set. Gemini AI functionality will be unavailable.")
-
 # --- Fyers Authentication Flow Endpoints ---
+
 @app.route('/fyers-login')
 def fyers_login():
     """
@@ -176,7 +152,7 @@ def fyers_login():
         client_id=CLIENT_ID,
         redirect_uri=REDIRECT_URI,
         response_type="code",
-        state="fyers_proxy_state", # A state parameter can be used for CSRF protection
+        state="fyers_proxy_state", # Use a unique state for security if needed
         secret_key=SECRET_KEY,
         grant_type="authorization_code"
     )
@@ -189,86 +165,93 @@ def fyers_auth_callback():
     """
     Callback endpoint after the user logs in on Fyers.
     Exchanges the auth_code for an access_token and refresh_token.
-    Then redirects back to the FRONTEND_URL.
     """
     auth_code = request.args.get('auth_code')
-    state = request.args.get('state') # You might want to validate this against the state sent in /fyers-login
+    state = request.args.get('state')
     error = request.args.get('error')
 
     if error:
         app.logger.error(f"Fyers authentication failed: {error}")
-        return redirect(f"{FRONTEND_URL}?error=Fyers+authentication+failed&details={error}")
+        return jsonify({"error": f"Fyers authentication failed: {error}"}), 400
     if not auth_code:
         app.logger.error("No auth_code received from Fyers.")
-        return redirect(f"{FRONTEND_URL}?error=Fyers+authentication+failed&details=No+auth_code+received")
+        return jsonify({"error": "No auth_code received from Fyers."}), 400
 
     session = fyersModel.SessionModel(
         client_id=CLIENT_ID,
         redirect_uri=REDIRECT_URI,
         response_type="code",
-        state=state, # Use the state received back from Fyers
+        state=state,
         secret_key=SECRET_KEY,
         grant_type="authorization_code"
     )
     session.set_token(auth_code)
     try:
         response = session.generate_token()
-
+        
         if response and response.get("s") == "ok":
             new_access_token = response["access_token"]
             new_refresh_token = response["refresh_token"] # Get the refresh token here
-
+            
             store_tokens(new_access_token, new_refresh_token) # Store both tokens
             initialize_fyers_model(new_access_token) # Re-initialize with the new access token
+            
             app.logger.info("Fyers tokens generated successfully!")
-
-            # Redirect back to the frontend with success parameters
-            return redirect(f"{FRONTEND_URL}?message=Fyers+tokens+generated+successfully&access_token_available=True")
+            return jsonify({"message": "Fyers tokens generated successfully!", "access_token_available": True})
         else:
             app.logger.error(f"Failed to generate Fyers tokens. Response: {response}")
-            return redirect(f"{FRONTEND_URL}?error=Fyers+authentication+failed&details={response.get('message', 'Unknown error')}")
+            return jsonify({"error": f"Failed to generate Fyers tokens. Response: {response}"}), 500
+        
     except Exception as e:
         app.logger.error(f"Error generating Fyers access token: {e}", exc_info=True)
-        return redirect(f"{FRONTEND_URL}?error=Fyers+authentication+failed&details={str(e)}")
+        return jsonify({"error": f"Failed to generate Fyers access token: {str(e)}"}), 500
+
 
 # --- Fyers Data Endpoints with Token Refresh Logic ---
+
+# Helper function to wrap Fyers API calls with refresh logic
 def make_fyers_api_call(api_method, *args, **kwargs):
     global fyers_instance
     if not fyers_instance:
         app.logger.warning("Fyers API not initialized. Attempting to initialize.")
         if not initialize_fyers_model():
+            # If initialization (including refresh) fails, we can't proceed
             return jsonify({"error": "Fyers API not initialized. Please authenticate first."}), 401
 
     try:
         return api_method(*args, **kwargs)
-    except Exception as e:
+    except Exception as e: # Catch a general exception
         error_message = str(e).lower()
-        # Check for common token-related error messages
-        if any(keyword in error_message for keyword in ["token", "authenticated", "login", "invalid_access_token", "invalid_grant"]):
+        # Common patterns for token expiry errors in messages or within the exception object
+        # You might need to inspect the 'e' object directly to see if it contains
+        # a response dict or specific error codes from Fyers.
+        # Example: if hasattr(e, 'response') and e.response.get('code') == -100:
+        
+        # Check for keywords that indicate token issues
+        if "token" in error_message or "authenticated" in error_message or "login" in error_message or "invalid_access_token" in error_message:
             app.logger.warning(f"Access token expired or invalid. Attempting to refresh. Original error: {e}")
             if refresh_access_token():
                 app.logger.info("Token refreshed, retrying original request.")
-                # IMPORTANT: After refresh, fyers_instance might have been updated.
-                # Re-check fyers_instance before retrying the call.
-                if fyers_instance:
-                    return api_method(*args, **kwargs)
-                else:
-                    app.logger.error("FyersModel not re-initialized after token refresh.")
-                    return jsonify({"error": "Fyers API token expired and refresh failed. Please re-authenticate."}), 401
+                # After successful refresh, fyers_instance is re-initialized with new token
+                return api_method(*args, **kwargs) # Retry the call
             else:
                 app.logger.error("Token refresh failed. Cannot fulfill request.")
+                # Instead of FyersException, raise a generic Exception or return an error response
                 return jsonify({"error": "Fyers API token expired and refresh failed. Please re-authenticate."}), 401
         else:
+            # Not a token error, re-raise original exception or return error
             app.logger.error(f"Non-token related Fyers API error: {e}", exc_info=True)
             return jsonify({"error": f"Fyers API error: {str(e)}"}), 500
 
 @app.route('/api/fyers/profile')
 def get_profile():
+    # make_fyers_api_call now returns a tuple (response, status_code) on error
+    # or the actual data on success.
     result = make_fyers_api_call(fyers_instance.get_profile)
-    # Check if result is an error tuple (jsonify, status_code) or actual data
     if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], int):
+        # This is an error response from make_fyers_api_call
         return result
-    return jsonify(result)
+    return jsonify(result) # It's the actual data
 
 @app.route('/api/fyers/funds')
 def get_funds():
@@ -287,64 +270,49 @@ def get_holdings():
 @app.route('/api/fyers/history', methods=['POST'])
 def get_history():
     data = request.json
+    
     required_params = ["symbol", "resolution", "date_format", "range_from", "range_to"]
     if not data or not all(k in data for k in required_params):
         app.logger.warning(f"Missing required parameters for history API. Received: {data}")
         return jsonify({"error": f"Missing required parameters for history API. Need {', '.join(required_params)}."}), 400
-
+    
     try:
         data["date_format"] = int(data["date_format"])
     except ValueError:
         app.logger.warning(f"Invalid 'date_format' received: {data.get('date_format')}")
         return jsonify({"error": "Invalid 'date_format'. Must be 0 or 1."}), 400
 
-    if data["date_format"] == 0: # Epoch format
+    if data["date_format"] == 0:
         current_time = int(time.time())
         requested_range_to = int(data["range_to"])
         resolution = data["resolution"]
 
         resolution_in_seconds = 0
-        # Convert resolution string to seconds for calculations
         if resolution.endswith('S'):
             resolution_in_seconds = int(resolution[:-1])
-        elif resolution.isdigit(): # assuming resolution like "60" means 60 minutes
+        elif resolution.isdigit():
             resolution_in_seconds = int(resolution) * 60
         elif resolution in ["D", "1D"]:
-            resolution_in_seconds = 24 * 60 * 60
-        # Add other common resolutions if necessary, e.g., "W", "M"
+            resolution_in_seconds = 24 * 60 * 60 
         else:
-            app.logger.warning(f"Unsupported resolution format for partial candle adjustment: {resolution}. Skipping adjustment.")
-            resolution_in_seconds = 0 # Do not adjust if resolution is unknown
+            app.logger.warning(f"Unsupported resolution format for partial candle adjustment: {resolution}")
 
         if resolution_in_seconds > 0:
-            # Calculate the start of the current *incomplete* candle
             current_resolution_start_epoch = (current_time // resolution_in_seconds) * resolution_in_seconds
-
-            # If the requested 'range_to' extends into the current incomplete candle,
-            # adjust it to the end of the last complete candle.
+            
             if requested_range_to >= current_resolution_start_epoch:
-                adjusted_range_to_epoch = current_resolution_start_epoch - 1 # End of the previous second
+                adjusted_range_to_epoch = current_resolution_start_epoch - 1
                 if adjusted_range_to_epoch < int(data["range_from"]):
                     app.logger.info(f"Adjusted range_to ({adjusted_range_to_epoch}) is less than range_from ({data['range_from']}). No complete candles available for resolution {resolution} in this range after adjustment.")
                     return jsonify({"candles": [], "s": "ok", "message": "No complete candles available for the adjusted range."})
 
                 data["range_to"] = str(adjusted_range_to_epoch)
                 app.logger.info(f"Adjusted 'range_to' for resolution '{resolution}' to ensure completed candles: {requested_range_to} -> {data['range_to']}")
-    
-    # Ensure cont_flag and oi_flag are integers if present
+        
     if "cont_flag" in data:
-        try:
-            data["cont_flag"] = int(data["cont_flag"])
-        except ValueError:
-            app.logger.warning(f"Invalid 'cont_flag' received: {data.get('cont_flag')}")
-            return jsonify({"error": "Invalid 'cont_flag'. Must be 0 or 1."}), 400
+        data["cont_flag"] = int(data["cont_flag"])
     if "oi_flag" in data:
-        try:
-            data["oi_flag"] = int(data["oi_flag"])
-        except ValueError:
-            app.logger.warning(f"Invalid 'oi_flag' received: {data.get('oi_flag')}")
-            return jsonify({"error": "Invalid 'oi_flag'. Must be 0 or 1."}), 400
-
+        data["oi_flag"] = int(data["oi_flag"])
 
     result = make_fyers_api_call(fyers_instance.history, data=data)
     if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], int):
@@ -357,7 +325,7 @@ def get_quotes():
     if not symbols:
         app.logger.warning("Missing 'symbols' parameter for quotes API.")
         return jsonify({"error": "Missing 'symbols' parameter. Eg: /api/fyers/quotes?symbols=NSE:SBIN-EQ,NSE:TCS-EQ"}), 400
-
+    
     data = {"symbols": symbols}
     result = make_fyers_api_call(fyers_instance.quotes, data=data)
     if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], int):
@@ -372,7 +340,7 @@ def get_market_depth():
     if not symbol or ohlcv_flag is None:
         app.logger.warning(f"Missing 'symbol' or 'ohlcv_flag' parameter for market depth. Symbol: {symbol}, Flag: {ohlcv_flag}")
         return jsonify({"error": "Missing 'symbol' or 'ohlcv_flag' parameter. Eg: /api/fyers/market_depth?symbol=NSE:SBIN-EQ&ohlcv_flag=1"}), 400
-
+    
     try:
         ohlcv_flag = int(ohlcv_flag)
         if ohlcv_flag not in [0, 1]:
@@ -380,7 +348,7 @@ def get_market_depth():
     except ValueError as ve:
         app.logger.warning(f"Invalid 'ohlcv_flag' received for market depth: {ohlcv_flag}")
         return jsonify({"error": f"Invalid 'ohlcv_flag': {ve}"}), 400
-
+    
     data = {
         "symbol": symbol,
         "ohlcv_flag": ohlcv_flag
@@ -398,16 +366,16 @@ def get_option_chain():
     if not symbol or not strikecount:
         app.logger.warning(f"Missing 'symbol' or 'strikecount' parameter for option chain. Symbol: {symbol}, Strikecount: {strikecount}")
         return jsonify({"error": "Missing 'symbol' or 'strikecount' parameter. Eg: /api/fyers/option_chain?symbol=NSE:TCS-EQ&strikecount=1"}), 400
-
+    
     try:
         strikecount = int(strikecount)
-        if not (1 <= strikecount <= 50): # Fyers API typically limits strikecount
+        if not (1 <= strikecount <= 50):
             app.logger.warning(f"Invalid 'strikecount' for option chain: {strikecount}. Must be between 1 and 50.")
             return jsonify({"error": "'strikecount' must be between 1 and 50."}), 400
     except ValueError:
         app.logger.warning(f"Invalid 'strikecount' received for option chain: {strikecount}. Must be an integer.")
         return jsonify({"error": "Invalid 'strikecount'. Must be an integer."}), 400
-
+    
     data = {
         "symbol": symbol,
         "strikecount": strikecount
@@ -420,6 +388,7 @@ def get_option_chain():
 @app.route('/api/fyers/news', methods=['GET'])
 def get_news():
     app.logger.info("Accessing placeholder news endpoint.")
+    
     news_headlines = [
         {"id": 1, "title": "Market sentiments positive on Q1 earnings", "source": "Fyers Internal Analysis", "timestamp": str(datetime.datetime.now())},
         {"id": 2, "title": "RBI holds interest rates steady", "source": "Economic Times", "timestamp": str(datetime.datetime.now() - datetime.timedelta(hours=2))},
@@ -431,99 +400,24 @@ def get_news():
         "news": news_headlines
     })
 
+
 @app.route('/api/fyers/place_order', methods=['POST'])
 def place_single_order():
     order_data = request.json
     if not order_data:
         app.logger.warning("No order data provided for placing order.")
         return jsonify({"error": "No order data provided."}), 400
-
+    
     result = make_fyers_api_call(fyers_instance.place_order, order_data)
     if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], int):
         return result
     return jsonify(result)
 
-# --- NEW MARKET CUES ENDPOINTS (Placeholder) ---
-@app.route('/api/market_cues/india_vix', methods=['GET'])
-def get_india_vix():
-    app.logger.info("Accessing placeholder India VIX endpoint.")
-    return jsonify({
-        "message": "This is placeholder data. Fyers API does not provide India VIX directly.",
-        "india_vix": 12.50, # Simulated value
-        "last_updated": datetime.datetime.now().isoformat()
-    })
-
-@app.route('/api/market_cues/sgx_nifty', methods=['GET'])
-def get_sgx_nifty():
-    app.logger.info("Accessing placeholder SGX Nifty endpoint.")
-    return jsonify({
-        "message": "This is placeholder data. Fyers API does not provide SGX Nifty directly.",
-        "sgx_nifty": 22250.75, # Simulated value
-        "change": "+50.20",
-        "change_percentage": "+0.23%",
-        "last_updated": datetime.datetime.now().isoformat()
-    })
-
-@app.route('/api/market_cues/dow_futures', methods=['GET'])
-def get_dow_futures():
-    app.logger.info("Accessing placeholder Dow Futures endpoint.")
-    return jsonify({
-        "message": "This is placeholder data. Fyers API does not provide Dow Futures directly.",
-        "dow_futures": 38765, # Simulated value
-        "change": "-120",
-        "change_percentage": "-0.31%",
-        "last_updated": datetime.datetime.now().isoformat()
-    })
-# --- END NEW MARKET CUES ENDPOINTS ---
-
-# --- NEW GEMINI AI ENDPOINT ---
-@app.route('/api/gemini/analyze', methods=['POST'])
-def analyze_with_gemini():
-    if not gemini_model:
-        return jsonify({"error": "Gemini AI is not configured on the server."}), 503
-
-    data = request.json
-    user_prompt = data.get('prompt')
-    # Using a more descriptive default if fyers_data is not provided
-    fyers_data = data.get('fyers_data', 'No specific Fyers data was provided for analysis.')
-
-    if not user_prompt:
-        return jsonify({"error": "Missing 'prompt' in request."}), 400
-
-    # Improved prompt for clarity and instructing AI on how to handle missing data
-    combined_prompt = (
-        f"You are an AI assistant analyzing financial market data. "
-        f"Here is some Fyers data:\n\n{fyers_data}\n\n"
-        f"User's request: {user_prompt}\n\n"
-        f"Based on the provided Fyers data and the user's request, provide a concise and actionable analysis. "
-        f"If the specific data required for the user's request is not present in the Fyers data provided, "
-        f"clearly state that the necessary information is unavailable and explain why, "
-        f"instead of generating speculative content."
-    )
-    try:
-        app.logger.info(f"Sending prompt to Gemini AI. Prompt length: {len(combined_prompt)} chars.")
-        response = gemini_model.generate_content(combined_prompt)
-        app.logger.info("Received response from Gemini AI.")
-        return jsonify({"analysis": response.text})
-    except genai.types.BlockedPromptException as e:
-        # Log the full block reason for debugging
-        app.logger.error(f"Gemini AI blocked prompt: {e.response.prompt_feedback.block_reason} - {e.response.prompt_feedback.safety_ratings}", exc_info=True)
-        return jsonify({"error": f"AI analysis blocked: {e.response.prompt_feedback.block_reason}. Please revise your prompt. Details: {e.response.prompt_feedback.safety_ratings}"}), 400
-    except Exception as e:
-        app.logger.error(f"Error calling Gemini AI: {e}", exc_info=True)
-        return jsonify({"error": f"Error during AI analysis: {str(e)}"}), 500
 
 @app.route('/')
 def home():
-    """
-    Render's default root needs to return something.
-    You could redirect to an external frontend URL here if your frontend is hosted separately
-    and not just run locally.
-    """
-    return f"Fyers API Proxy Server is running! Access the frontend at <a href='{FRONTEND_URL}'>{FRONTEND_URL}</a>. Use /fyers-login to authenticate or /api/fyers/news for news (placeholder)."
+    return "Fyers API Proxy Server is running! Use /fyers-login to authenticate or /api/fyers/news for news (placeholder)."
+
 
 if __name__ == '__main__':
-    # For local testing, ensure you have a .env file with FYERS_CLIENT_ID, etc.
-    # and also GEMINI_API_KEY if you're testing Gemini locally.
-    # Also, set FRONTEND_URL to where your index.html is served if not default.
     app.run(host='0.0.0.0', port=5000)
