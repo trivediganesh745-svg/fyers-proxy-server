@@ -1,0 +1,350 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Fyers & Gemini Financial Analyzer</title>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 20px; background-color: #f4f7f6; color: #333; }
+        .container { max-width: 900px; margin: 0 auto; background-color: #fff; padding: 30px; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.08); }
+        h1, h2 { color: #2c3e50; border-bottom: 2px solid #e0e0e0; padding-bottom: 10px; margin-top: 25px; }
+        .button {
+            background-color: #007bff;
+            color: white;
+            padding: 10px 18px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 16px;
+            transition: background-color 0.2s ease;
+            margin-right: 10px;
+            margin-bottom: 10px; /* Added for better spacing */
+        }
+        .button:hover { background-color: #0056b3; }
+        .button:disabled { background-color: #cccccc; cursor: not-allowed; }
+        .input-group { margin-bottom: 15px; }
+        .input-group label { display: block; margin-bottom: 5px; font-weight: bold; color: #555; }
+        .input-group input[type="text"],
+        .input-group input[type="date"],
+        .input-group select,
+        .input-group textarea {
+            width: calc(100% - 22px);
+            padding: 10px;
+            border: 1px solid #ccc;
+            border-radius: 5px;
+            font-size: 14px;
+        }
+        .input-group textarea { min-height: 80px; resize: vertical; }
+        .output-box {
+            background-color: #e9ecef;
+            border: 1px solid #dee2e6;
+            padding: 15px;
+            border-radius: 5px;
+            min-height: 100px;
+            overflow-x: auto;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            margin-top: 15px;
+            color: #495057;
+            font-family: 'Consolas', 'Monaco', monospace;
+        }
+        .message { padding: 10px; margin-bottom: 15px; border-radius: 5px; }
+        .message.success { background-color: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
+        .message.error { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
+        .loading {
+            display: inline-block;
+            width: 20px;
+            height: 20px;
+            border: 3px solid rgba(0,0,0,.3);
+            border-radius: 50%;
+            border-top-color: #007bff;
+            animation: spin 1s ease-in-out infinite;
+            -webkit-animation: spin 1s ease-in-out infinite;
+            margin-left: 10px;
+            vertical-align: middle;
+        }
+        @keyframes spin {
+            to { -webkit-transform: rotate(360deg); }
+        }
+        @-webkit-keyframes spin {
+            to { -webkit-transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Fyers & Gemini Financial Analyzer</h1>
+
+        <div id="status-message" class="message" style="display: none;"></div>
+
+        <div class="input-group">
+            <label for="backendUrl">Backend Proxy Server URL:</label>
+            <input type="text" id="backendUrl" value="https://fyers-proxy-server.onrender.com" readonly>
+        </div>
+
+        <h2>Fyers Authentication</h2>
+        <button id="fyersLoginBtn" class="button">Login to Fyers</button>
+        <p>
+            <strong id="fyersAuthStatus">Status: Not Authenticated</strong>
+        </p>
+
+        <div id="fyers-authenticated-section" style="display: none;">
+            <h2>Fyers Data Retrieval</h2>
+            <p>
+                Access Token Available (backend status): <span id="accessTokenAvailable">False</span> <br>
+                Refresh Token Available (backend status): <span id="refreshTokenAvailable">False</span>
+            </p>
+
+            <button id="getProfileBtn" class="button">Get Profile</button>
+            <button id="getFundsBtn" class="button">Get Funds</button>
+            <button id="getHoldingsBtn" class="button">Get Holdings</button>
+            <button id="getQuotesBtn" class="button">Get Quotes (NSE:SBIN-EQ)</button>
+            <button id="getNewsBtn" class="button">Get News (Placeholder)</button>
+            <div class="output-box" id="fyersOutput">Fyers API response will appear here.</div>
+
+            <h3>Market Cues (Placeholder)</h3>
+            <button id="getIndiaVIXBtn" class="button">Get India VIX</button>
+            <button id="getSGXNiftyBtn" class="button">Get SGX Nifty</button>
+            <button id="getDowFuturesBtn" class="button">Get Dow Futures</button>
+            <div class="output-box" id="marketCuesOutput">Market Cues will appear here.</div>
+
+            <h3>Get History Data</h3>
+            <div class="input-group">
+                <label for="historySymbol">Symbol:</label>
+                <input type="text" id="historySymbol" value="NSE:NIFTY50-INDEX">
+            </div>
+            <div class="input-group">
+                <label for="historyResolution">Resolution (e.g., 1, 5, 15, 60, D):</label>
+                <input type="text" id="historyResolution" value="15">
+            </div>
+            <div class="input-group">
+                <label for="historyDateFormat">Date Format (0: Epoch, 1: YYYY-MM-DD):</label>
+                <select id="historyDateFormat">
+                    <option value="0">0 (Epoch)</option>
+                    <option value="1">1 (YYYY-MM-DD)</option>
+                </select>
+            </div>
+            <div class="input-group">
+                <label for="historyRangeFrom">Range From (Date or Epoch, use YYYY-MM-DD for date format 1):</label>
+                <input type="text" id="historyRangeFrom" value="2023-01-01">
+            </div>
+            <div class="input-group">
+                <label for="historyRangeTo">Range To (Date or Epoch, use YYYY-MM-DD for date format 1):</label>
+                <input type="text" id="historyRangeTo" value="2024-01-01">
+            </div>
+            <button id="getHistoryBtn" class="button">Get History</button>
+            <div class="output-box" id="historyOutput">History data will appear here.</div>
+        </div>
+
+        <h2>Gemini AI Analysis</h2>
+        <div class="input-group">
+            <label for="geminiPrompt">Your Prompt for AI:</label>
+            <textarea id="geminiPrompt" placeholder="Ask Gemini to analyze the data, e.g., 'What are the trends in the history data?', 'Summarize the market cues and Fyers profile.'"></textarea>
+        </div>
+        <div class="input-group">
+            <label for="fyersDataForGemini">Fyers Data to provide to Gemini (from above outputs):</label>
+            <textarea id="fyersDataForGemini" placeholder="Paste relevant Fyers data here (e.g., history, quotes, funds, profile)." style="min-height: 150px;"></textarea>
+        </div>
+        <button id="analyzeWithGeminiBtn" class="button">Analyze with Gemini</button> <span id="geminiLoading" class="loading" style="display: none;"></span>
+        <div class="output-box" id="geminiOutput">Gemini's analysis will appear here.</div>
+    </div>
+    <script>
+        const backendUrl = document.getElementById('backendUrl').value;
+        const statusMessage = document.getElementById('status-message');
+        const fyersAuthStatus = document.getElementById('fyersAuthStatus');
+        const fyersAuthenticatedSection = document.getElementById('fyers-authenticated-section');
+        const accessTokenAvailable = document.getElementById('accessTokenAvailable');
+        const refreshTokenAvailable = document.getElementById('refreshTokenAvailable');
+
+        // Output areas
+        const fyersOutput = document.getElementById('fyersOutput');
+        const marketCuesOutput = document.getElementById('marketCuesOutput');
+        const historyOutput = document.getElementById('historyOutput');
+        const geminiOutput = document.getElementById('geminiOutput');
+        const geminiLoading = document.getElementById('geminiLoading');
+
+        // Function to display messages
+        function showMessage(message, type) {
+            statusMessage.textContent = message;
+            statusMessage.className = `message ${type}`;
+            statusMessage.style.display = 'block';
+            // Auto-hide after 5 seconds
+            setTimeout(() => {
+                statusMessage.style.display = 'none';
+            }, 5000);
+        }
+
+        // Check URL parameters for Fyers auth callback
+        const urlParams = new URLSearchParams(window.location.search);
+        const authMessage = urlParams.get('message');
+        const authError = urlParams.get('error');
+        const tokenAvailable = urlParams.get('access_token_available');
+
+        if (authMessage) {
+            showMessage(authMessage, 'success');
+            if (tokenAvailable === 'True') {
+                fyersAuthStatus.textContent = 'Status: Authenticated';
+                fyersAuthenticatedSection.style.display = 'block';
+                accessTokenAvailable.textContent = 'True';
+                refreshTokenAvailable.textContent = 'True'; // Assuming refresh token is also set on backend
+                localStorage.setItem('fyersAuthenticated', 'true');
+            }
+        } else if (authError) {
+            showMessage(`Fyers Authentication Error: ${authError} - ${urlParams.get('details')}`, 'error');
+            fyersAuthStatus.textContent = 'Status: Authentication Failed';
+            localStorage.removeItem('fyersAuthenticated');
+        } else {
+            // Check if already authenticated from previous session (local storage is simple, not secure)
+            if (localStorage.getItem('fyersAuthenticated') === 'true') {
+                fyersAuthStatus.textContent = 'Status: Authenticated (Session might be active)';
+                fyersAuthenticatedSection.style.display = 'block';
+                accessTokenAvailable.textContent = 'True';
+                refreshTokenAvailable.textContent = 'True';
+            }
+        }
+
+        // Fyers Login Button
+        document.getElementById('fyersLoginBtn').addEventListener('click', () => {
+            // IMPORTANT: Redirect the *entire page* to the proxy's login endpoint.
+            // This is crucial for security and to bypass X-Frame-Options.
+            window.location.href = `${backendUrl}/fyers-login`;
+        });
+
+        // Generic Fyers API call function
+        async function callFyersApi(endpoint, method = 'GET', body = null) {
+            const options = {
+                method: method,
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+            };
+            if (body) {
+                options.body = JSON.stringify(body);
+            }
+
+            try {
+                const response = await fetch(`${backendUrl}${endpoint}`, options);
+                const data = await response.json();
+                if (!response.ok) {
+                    showMessage(`Error calling ${endpoint}: ${data.error || response.statusText}`, 'error');
+                    // If 401, indicate re-authentication needed
+                    if (response.status === 401) {
+                        fyersAuthStatus.textContent = 'Status: Token Expired, Re-authenticate!';
+                        localStorage.removeItem('fyersAuthenticated');
+                        fyersAuthenticatedSection.style.display = 'none';
+                    }
+                    return null;
+                }
+                return data;
+            } catch (error) {
+                showMessage(`Network error calling ${endpoint}: ${error.message}`, 'error');
+                return null;
+            }
+        }
+
+        // Fyers Data Buttons
+        document.getElementById('getProfileBtn').addEventListener('click', async () => {
+            fyersOutput.textContent = 'Fetching profile...';
+            const data = await callFyersApi('/api/fyers/profile');
+            if (data) fyersOutput.textContent = JSON.stringify(data, null, 2);
+        });
+
+        document.getElementById('getFundsBtn').addEventListener('click', async () => {
+            fyersOutput.textContent = 'Fetching funds...';
+            const data = await callFyersApi('/api/fyers/funds');
+            if (data) fyersOutput.textContent = JSON.stringify(data, null, 2);
+        });
+
+        document.getElementById('getHoldingsBtn').addEventListener('click', async () => {
+            fyersOutput.textContent = 'Fetching holdings...';
+            const data = await callFyersApi('/api/fyers/holdings');
+            if (data) fyersOutput.textContent = JSON.stringify(data, null, 2);
+        });
+
+        document.getElementById('getQuotesBtn').addEventListener('click', async () => {
+            fyersOutput.textContent = 'Fetching quotes for NSE:SBIN-EQ...';
+            const data = await callFyersApi('/api/fyers/quotes?symbols=NSE:SBIN-EQ');
+            if (data) fyersOutput.textContent = JSON.stringify(data, null, 2);
+        });
+
+        document.getElementById('getNewsBtn').addEventListener('click', async () => {
+            fyersOutput.textContent = 'Fetching news...';
+            const data = await callFyersApi('/api/fyers/news');
+            if (data) fyersOutput.textContent = JSON.stringify(data, null, 2);
+        });
+
+        // Market Cues Buttons
+        document.getElementById('getIndiaVIXBtn').addEventListener('click', async () => {
+            marketCuesOutput.textContent = 'Fetching India VIX...';
+            const data = await callFyersApi('/api/market_cues/india_vix');
+            if (data) marketCuesOutput.textContent = JSON.stringify(data, null, 2);
+        });
+
+        document.getElementById('getSGXNiftyBtn').addEventListener('click', async () => {
+            marketCuesOutput.textContent = 'Fetching SGX Nifty...';
+            const data = await callFyersApi('/api/market_cues/sgx_nifty');
+            if (data) marketCuesOutput.textContent = JSON.stringify(data, null, 2);
+        });
+
+        document.getElementById('getDowFuturesBtn').addEventListener('click', async () => {
+            marketCuesOutput.textContent = 'Fetching Dow Futures...';
+            const data = await callFyersApi('/api/market_cues/dow_futures');
+            if (data) marketCuesOutput.textContent = JSON.stringify(data, null, 2);
+        });
+
+        // Get History Button
+        document.getElementById('getHistoryBtn').addEventListener('click', async () => {
+            historyOutput.textContent = 'Fetching history data...';
+            const symbol = document.getElementById('historySymbol').value;
+            const resolution = document.getElementById('historyResolution').value;
+            const dateFormat = document.getElementById('historyDateFormat').value;
+            let rangeFrom = document.getElementById('historyRangeFrom').value;
+            let rangeTo = document.getElementById('historyRangeTo').value;
+
+            // Convert dates to epoch if date_format is 0
+            if (dateFormat === '0') {
+                rangeFrom = new Date(rangeFrom).getTime() / 1000;
+                rangeTo = new Date(rangeTo).getTime() / 1000;
+            }
+
+            const historyData = {
+                symbol: symbol,
+                resolution: resolution,
+                date_format: dateFormat,
+                range_from: rangeFrom.toString(),
+                range_to: rangeTo.toString(),
+            };
+
+            const data = await callFyersApi('/api/fyers/history', 'POST', historyData);
+            if (data) {
+                historyOutput.textContent = JSON.stringify(data, null, 2);
+                document.getElementById('fyersDataForGemini').value = JSON.stringify(data, null, 2); // Populate Gemini input
+            }
+        });
+
+        // Analyze with Gemini Button
+        document.getElementById('analyzeWithGeminiBtn').addEventListener('click', async () => {
+            geminiOutput.textContent = 'Sending to Gemini for analysis...';
+            geminiLoading.style.display = 'inline-block';
+            const prompt = document.getElementById('geminiPrompt').value;
+            const fyersData = document.getElementById('fyersDataForGemini').value;
+
+            if (!prompt) {
+                showMessage('Please enter a prompt for Gemini.', 'error');
+                geminiOutput.textContent = '';
+                geminiLoading.style.display = 'none';
+                return;
+            }
+
+            const analysisRequest = {
+                prompt: prompt,
+                fyers_data: fyersData
+            };
+
+            const data = await callFyersApi('/api/gemini/analyze', 'POST', analysisRequest);
+            if (data) geminiOutput.textContent = data.analysis;
+            geminiLoading.style.display = 'none';
+        });
+    </script>
+</body>
+</html>
