@@ -5,3 +5,5 @@ gunicorn
 Flask-Cors
 google-generativeai
 requests # Added as it's often useful for external API calls, even if placeholders
+flask-sock
+simple-websocket
