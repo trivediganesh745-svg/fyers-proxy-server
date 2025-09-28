@@ -1,8 +1,6 @@
 import os
 from flask import Flask, request, jsonify, redirect, url_for
 from fyers_apiv3 import fyersModel
-# Remove the problematic import:
-# from fyers_apiv3.fyersModel import FyersException # Assuming this exception exists
 from dotenv import load_dotenv
 from flask_cors import CORS
 import datetime
@@ -289,19 +287,31 @@ def get_history():
 
         resolution_in_seconds = 0
         if resolution.endswith('S'):
-            resolution_in_seconds = int(resolution[:-1])
+            try:
+                resolution_in_seconds = int(resolution[:-1])
+            except ValueError:
+                app.logger.warning(f"Invalid numeric part in resolution ending with 'S': {resolution}")
+                return jsonify({"error": "Invalid resolution format."}), 400
         elif resolution.isdigit():
+            # This handles minute resolutions like "1", "5", "30", etc.
             resolution_in_seconds = int(resolution) * 60
         elif resolution in ["D", "1D"]:
             resolution_in_seconds = 24 * 60 * 60 
         else:
             app.logger.warning(f"Unsupported resolution format for partial candle adjustment: {resolution}")
+            return jsonify({"error": "Unsupported resolution format."}), 400
 
         if resolution_in_seconds > 0:
+            # Calculate the start epoch of the current *incomplete* candle
             current_resolution_start_epoch = (current_time // resolution_in_seconds) * resolution_in_seconds
             
+            # If the requested `range_to` includes or goes past the start of the current incomplete candle,
+            # adjust `range_to` to the end of the *last complete* candle.
+            # This means setting it to one second before the start of the current incomplete candle.
             if requested_range_to >= current_resolution_start_epoch:
                 adjusted_range_to_epoch = current_resolution_start_epoch - 1
+                
+                # Ensure the adjusted range_to is not before range_from
                 if adjusted_range_to_epoch < int(data["range_from"]):
                     app.logger.info(f"Adjusted range_to ({adjusted_range_to_epoch}) is less than range_from ({data['range_from']}). No complete candles available for resolution {resolution} in this range after adjustment.")
                     return jsonify({"candles": [], "s": "ok", "message": "No complete candles available for the adjusted range."})
