@@ -28,7 +28,6 @@ REFRESH_TOKEN = os.environ.get("FYERS_REFRESH_TOKEN")
 
 if not all([CLIENT_ID, SECRET_KEY, REDIRECT_URI]):
     app.logger.error("ERROR: Fyers API credentials (CLIENT_ID, SECRET_KEY, REDIRECT_URI) are not fully set. Please check your .env file or environment variables.")
-    # Exit or raise error, as core functionality won't work
     # For a web app, you might want to return a user-friendly error page/message
     # sys.exit(1) # Uncomment if you want the app to stop on missing essentials
 
@@ -46,11 +45,9 @@ def store_tokens(access_token, refresh_token):
     ACCESS_TOKEN = access_token
     REFRESH_TOKEN = refresh_token
     
-    # In a real app, write these to a file or database.
-    # For demonstration, we'll print them.
     app.logger.info("Tokens updated. For persistence, save these securely:")
-    app.logger.info(f"New Access Token: {ACCESS_TOKEN}")
-    app.logger.info(f"New Refresh Token: {REFRESH_TOKEN}")
+    app.logger.info(f"New Access Token: {ACCESS_TOKEN[:10]}...")
+    app.logger.info(f"New Refresh Token: {REFRESH_TOKEN[:10]}...")
     
     # Example of saving to a file (simple, but not recommended for production security)
     # with open("tokens.json", "w") as f:
@@ -220,10 +217,6 @@ def make_fyers_api_call(api_method, *args, **kwargs):
         return api_method(*args, **kwargs)
     except Exception as e: # Catch a general exception
         error_message = str(e).lower()
-        # Common patterns for token expiry errors in messages or within the exception object
-        # You might need to inspect the 'e' object directly to see if it contains
-        # a response dict or specific error codes from Fyers.
-        # Example: if hasattr(e, 'response') and e.response.get('code') == -100:
         
         # Check for keywords that indicate token issues
         if "token" in error_message or "authenticated" in error_message or "login" in error_message or "invalid_access_token" in error_message:
@@ -234,22 +227,17 @@ def make_fyers_api_call(api_method, *args, **kwargs):
                 return api_method(*args, **kwargs) # Retry the call
             else:
                 app.logger.error("Token refresh failed. Cannot fulfill request.")
-                # Instead of FyersException, raise a generic Exception or return an error response
                 return jsonify({"error": "Fyers API token expired and refresh failed. Please re-authenticate."}), 401
         else:
-            # Not a token error, re-raise original exception or return error
             app.logger.error(f"Non-token related Fyers API error: {e}", exc_info=True)
             return jsonify({"error": f"Fyers API error: {str(e)}"}), 500
 
 @app.route('/api/fyers/profile')
 def get_profile():
-    # make_fyers_api_call now returns a tuple (response, status_code) on error
-    # or the actual data on success.
     result = make_fyers_api_call(fyers_instance.get_profile)
     if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], int):
-        # This is an error response from make_fyers_api_call
         return result
-    return jsonify(result) # It's the actual data
+    return jsonify(result)
 
 @app.route('/api/fyers/funds')
 def get_funds():
@@ -411,14 +399,185 @@ def get_news():
     })
 
 
-@app.route('/api/fyers/place_order', methods=['POST'])
+# --- New Order Placement and Modification APIs ---
+
+@app.route('/api/fyers/order', methods=['POST'])
 def place_single_order():
     order_data = request.json
     if not order_data:
-        app.logger.warning("No order data provided for placing order.")
-        return jsonify({"error": "No order data provided."}), 400
+        return jsonify({"error": "Order data is required."}), 400
+    result = make_fyers_api_call(fyers_instance.place_order, data=order_data)
+    if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], int):
+        return result
+    return jsonify(result)
+
+@app.route('/api/fyers/orders/multi', methods=['POST'])
+def place_multi_order():
+    multi_order_data = request.json
+    if not multi_order_data or not isinstance(multi_order_data, list):
+        return jsonify({"error": "An array of order objects is required for multi-order placement."}), 400
     
-    result = make_fyers_api_call(fyers_instance.place_order, order_data)
+    # The fyersModel.multi_order method takes a list of order objects directly
+    result = make_fyers_api_call(fyers_instance.multi_order, data=multi_order_data)
+    if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], int):
+        return result
+    return jsonify(result)
+
+@app.route('/api/fyers/orders/multileg', methods=['POST'])
+def place_multileg_order():
+    multileg_data = request.json
+    if not multileg_data:
+        return jsonify({"error": "Multileg order data is required."}), 400
+    result = make_fyers_api_call(fyers_instance.multileg_order, data=multileg_data)
+    if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], int):
+        return result
+    return jsonify(result)
+
+@app.route('/api/fyers/gtt/order', methods=['POST'])
+def place_gtt_order():
+    gtt_order_data = request.json
+    if not gtt_order_data:
+        return jsonify({"error": "GTT order data is required."}), 400
+    result = make_fyers_api_call(fyers_instance.place_gttorder, data=gtt_order_data)
+    if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], int):
+        return result
+    return jsonify(result)
+
+@app.route('/api/fyers/gtt/order', methods=['PATCH'])
+def modify_gtt_order():
+    gtt_modify_data = request.json
+    if not gtt_modify_data or not gtt_modify_data.get("id"):
+        return jsonify({"error": "GTT order ID and modification data are required."}), 400
+    
+    # The SDK's modify_gttorder expects the ID and then the modification data
+    order_id = gtt_modify_data.pop("id")
+    result = make_fyers_api_call(fyers_instance.modify_gttorder, id=order_id, data=gtt_modify_data)
+    if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], int):
+        return result
+    return jsonify(result)
+
+@app.route('/api/fyers/gtt/order', methods=['DELETE'])
+def cancel_gtt_order():
+    gtt_cancel_data = request.json
+    if not gtt_cancel_data or not gtt_cancel_data.get("id"):
+        return jsonify({"error": "GTT order ID is required for cancellation."}), 400
+    
+    order_id = gtt_cancel_data.get("id")
+    result = make_fyers_api_call(fyers_instance.cancel_gttorder, id=order_id)
+    if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], int):
+        return result
+    return jsonify(result)
+
+@app.route('/api/fyers/gtt/orders', methods=['GET'])
+def get_gtt_orders():
+    result = make_fyers_api_call(fyers_instance.gtt_orders)
+    if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], int):
+        return result
+    return jsonify(result)
+
+@app.route('/api/fyers/order', methods=['PATCH'])
+def modify_single_order():
+    modify_data = request.json
+    if not modify_data or not modify_data.get("id"):
+        return jsonify({"error": "Order ID and modification data are required."}), 400
+    
+    # The SDK's modify_order expects the modification data directly
+    result = make_fyers_api_call(fyers_instance.modify_order, data=modify_data)
+    if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], int):
+        return result
+    return jsonify(result)
+
+@app.route('/api/fyers/orders/multi', methods=['PATCH'])
+def modify_multi_orders():
+    modify_basket_data = request.json
+    if not modify_basket_data or not isinstance(modify_basket_data, list):
+        return jsonify({"error": "An array of order modification objects is required."}), 400
+    
+    # The SDK's modify_basket_orders expects a list of order modification objects
+    result = make_fyers_api_call(fyers_instance.modify_basket_orders, data=modify_basket_data)
+    if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], int):
+        return result
+    return jsonify(result)
+
+@app.route('/api/fyers/order', methods=['DELETE'])
+def cancel_single_order():
+    cancel_data = request.json
+    if not cancel_data or not cancel_data.get("id"):
+        return jsonify({"error": "Order ID is required for cancellation."}), 400
+    
+    # The SDK's cancel_order expects the cancellation data directly (which contains 'id')
+    result = make_fyers_api_call(fyers_instance.cancel_order, data=cancel_data)
+    if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], int):
+        return result
+    return jsonify(result)
+
+@app.route('/api/fyers/orders/multi', methods=['DELETE'])
+def cancel_multi_orders():
+    cancel_basket_data = request.json
+    if not cancel_basket_data or not isinstance(cancel_basket_data, list):
+        return jsonify({"error": "An array of order cancellation objects (with 'id') is required."}), 400
+    
+    # The SDK's cancel_basket_orders expects a list of cancellation objects
+    result = make_fyers_api_call(fyers_instance.cancel_basket_orders, data=cancel_basket_data)
+    if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], int):
+        return result
+    return jsonify(result)
+
+@app.route('/api/fyers/positions', methods=['DELETE'])
+def exit_positions():
+    exit_data = request.json
+    if not exit_data:
+        return jsonify({"error": "Request body for exiting positions is required."}), 400
+    
+    # The positions API for delete can take different parameters based on intent
+    # This endpoint will be flexible to handle 'exit_all', 'id', or segment/side/productType filters
+    result = make_fyers_api_call(fyers_instance.exit_positions, data=exit_data)
+    if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], int):
+        return result
+    return jsonify(result)
+
+@app.route('/api/fyers/positions', methods=['POST'])
+def convert_position():
+    convert_data = request.json
+    if not convert_data:
+        return jsonify({"error": "Position conversion data is required."}), 400
+    
+    result = make_fyers_api_call(fyers_instance.convert_positions, data=convert_data)
+    if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], int):
+        return result
+    return jsonify(result)
+
+# --- Margin Calculator APIs ---
+
+@app.route('/api/fyers/margin/span', methods=['POST'])
+def span_margin_calculator():
+    margin_data = request.json
+    if not margin_data or not margin_data.get("data"):
+        return jsonify({"error": "An array of order details for span margin calculation is required under 'data' key."}), 400
+    
+    # The SDK's span_margin expects 'data' as the key in the payload
+    result = make_fyers_api_call(fyers_instance.span_margin, data=margin_data)
+    if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], int):
+        return result
+    return jsonify(result)
+
+@app.route('/api/fyers/margin/multiorder', methods=['POST'])
+def multiorder_margin_calculator():
+    margin_data = request.json
+    if not margin_data or not margin_data.get("data"):
+        return jsonify({"error": "An array of order details for multiorder margin calculation is required under 'data' key."}), 400
+    
+    # The SDK's multiorder_margin expects 'data' as the key in the payload
+    result = make_fyers_api_call(fyers_instance.multiorder_margin, data=margin_data)
+    if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], int):
+        return result
+    return jsonify(result)
+
+# --- Broker Config APIs ---
+
+@app.route('/api/fyers/market_status', methods=['GET'])
+def get_market_status():
+    result = make_fyers_api_call(fyers_instance.market_status)
     if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], int):
         return result
     return jsonify(result)
