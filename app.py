@@ -7,7 +7,7 @@ import datetime
 import time
 import logging
 import json
-import threading
+import math
 
 # Load environment variables from .env file (for local development)
 load_dotenv()
@@ -23,83 +23,68 @@ app.logger.setLevel(logging.INFO)
 CLIENT_ID = os.environ.get("FYERS_CLIENT_ID")
 SECRET_KEY = os.environ.get("FYERS_SECRET_KEY")
 REDIRECT_URI = os.environ.get("FYERS_REDIRECT_URI")
-
 # These will be updated dynamically and potentially saved persistently
 ACCESS_TOKEN = os.environ.get("FYERS_ACCESS_TOKEN")
 REFRESH_TOKEN = os.environ.get("FYERS_REFRESH_TOKEN")
 
-TOKENS_FILE = os.environ.get("FYERS_TOKENS_FILE", "tokens.json")  # optional persistent file example
-
 if not all([CLIENT_ID, SECRET_KEY, REDIRECT_URI]):
     app.logger.error("ERROR: Fyers API credentials (CLIENT_ID, SECRET_KEY, REDIRECT_URI) are not fully set. Please check your .env file or environment variables.")
-    # You may want to halt startup in production, but keep server running for local dev:
-    # raise SystemExit("Missing Fyers credentials")
+    # For a web app, you might want to return a user-friendly error page/message
+    # sys.exit(1) # Uncomment if you want the app to stop on missing essentials
 
 # Initialize FyersModel (will be re-initialized with an access token after login or refresh)
 fyers_instance = None
 
-# --- Persistent Storage Helpers ---
-def _save_tokens_to_file(access_token, refresh_token):
-    try:
-        with open(TOKENS_FILE, "w") as f:
-            json.dump({"access_token": access_token, "refresh_token": refresh_token}, f)
-        app.logger.info(f"Tokens persisted to {TOKENS_FILE}")
-    except Exception as e:
-        app.logger.warning(f"Failed to persist tokens to {TOKENS_FILE}: {e}")
+# --- Persistent Storage Placeholder ---
+# In a real application, you would save/load tokens from a database, file,
+# or a more secure key-value store. For this example, we'll simulate it
+# by updating the global variables, but this is NOT persistent across server restarts.
+# For production, consider using Redis, a simple JSON file, or a proper DB.
 
-def _load_tokens_from_file():
-    global ACCESS_TOKEN, REFRESH_TOKEN
-    if os.path.exists(TOKENS_FILE):
-        try:
-            with open(TOKENS_FILE, "r") as f:
-                data = json.load(f)
-            ACCESS_TOKEN = data.get("access_token", ACCESS_TOKEN)
-            REFRESH_TOKEN = data.get("refresh_token", REFRESH_TOKEN)
-            app.logger.info("Loaded tokens from tokens file.")
-        except Exception as e:
-            app.logger.warning(f"Failed to load tokens from file: {e}")
-
-def store_tokens(access_token, refresh_token, persist=True):
-    """
-    Update global tokens and optionally persist to file.
-    WARNING: Storing tokens in plain files is NOT recommended in production.
-    Use secure stores like AWS Secrets Manager, Vault, or encrypted DB.
-    """
+def store_tokens(access_token, refresh_token):
     global ACCESS_TOKEN, REFRESH_TOKEN
     ACCESS_TOKEN = access_token
     REFRESH_TOKEN = refresh_token
 
-    app.logger.info("Tokens updated in memory.")
+    # It's generally not safe to log full tokens. We log truncated versions for debugging.
+    app.logger.info("Tokens updated. For persistence, save these securely.")
     try:
-        # Log only partial tokens to avoid full secret printing
-        app.logger.info(f"New Access Token (prefix): {ACCESS_TOKEN[:10]}...")
-        app.logger.info(f"New Refresh Token (prefix): {REFRESH_TOKEN[:10]}...")
+        app.logger.info(f"New Access Token: {ACCESS_TOKEN[:10]}...") if ACCESS_TOKEN else None
+        app.logger.info(f"New Refresh Token: {REFRESH_TOKEN[:10]}...") if REFRESH_TOKEN else None
     except Exception:
-        # Defensive: token might be None or shorter
-        pass
+        # Defensive: in case tokens are None or not indexable
+        app.logger.info("Tokens updated (could not display snippet).")
 
-    if persist:
-        _save_tokens_to_file(access_token, refresh_token)
+    # Example of saving to a file (simple, but not recommended for production security)
+    # with open("tokens.json", "w") as f:
+    #     json.dump({"access_token": access_token, "refresh_token": refresh_token}, f)
 
 def load_tokens():
-    """
-    Load tokens from persistent file if available. Environment variables still have priority
-    and are read at module load; this function augments them if file exists.
-    """
-    _load_tokens_from_file()
-    # If environment variables were set, they remain in ACCESS_TOKEN/REFRESH_TOKEN
+    global ACCESS_TOKEN, REFRESH_TOKEN
+    # In a real app, load from your persistent storage
+    # For this example, we're loading from environment variables at startup.
+    # If using a file:
+    # try:
+    #     with open("tokens.json", "r") as f:
+    #         data = json.load(f)
+    #         ACCESS_TOKEN = data.get("access_token")
+    #         REFRESH_TOKEN = data.get("refresh_token")
+    # except FileNotFoundError:
+    #     app.logger.info("tokens.json not found, starting fresh.")
+    pass
 
-# Load tokens at startup (file-based fallback)
+# Load tokens at startup
 load_tokens()
 
 def initialize_fyers_model(token=None):
     """
-    Initialize the fyers_model instance with the provided token or the global ACCESS_TOKEN.
-    If no access token but REFRESH_TOKEN exists, try refreshing.
-    Returns True if fyers_instance is available, False otherwise.
+    Initialize (or re-init) fyers_instance. If token is provided, use it,
+    otherwise use global ACCESS_TOKEN, or attempt refresh via REFRESH_TOKEN.
+    Returns True if initialized, False otherwise.
     """
     global fyers_instance, ACCESS_TOKEN, REFRESH_TOKEN
 
+    # Prioritize provided token, then global ACCESS_TOKEN
     token_to_use = token if token else ACCESS_TOKEN
 
     if token_to_use:
@@ -110,58 +95,48 @@ def initialize_fyers_model(token=None):
         except Exception as e:
             app.logger.error(f"Failed to initialize FyersModel with token: {e}", exc_info=True)
             fyers_instance = None
+            # attempt refresh if refresh token exists
+            if REFRESH_TOKEN:
+                return refresh_access_token()
             return False
     elif REFRESH_TOKEN and CLIENT_ID and SECRET_KEY:
         app.logger.info("No access token provided or found, attempting to use refresh token.")
-        if refresh_access_token():
-            app.logger.info("FyersModel initialized with refreshed access token.")
-            return True
-        else:
-            app.logger.error("Could not initialize FyersModel: Refresh token failed.")
-            return False
+        # Attempt to refresh using the refresh token
+        return refresh_access_token()
     else:
         app.logger.warning("FyersModel could not be initialized: No access token or refresh token available.")
         return False
 
 def refresh_access_token():
     """
-    Use the SDK's SessionModel to refresh access token using REFRESH_TOKEN.
-    Returns True on success and updates global tokens and fyers_instance.
+    Refresh access token using the fyers SessionModel with grant_type=refresh_token.
+    Returns True if refresh succeeded and fyers_instance re-initialized.
     """
     global ACCESS_TOKEN, REFRESH_TOKEN
     if not REFRESH_TOKEN:
         app.logger.error("Cannot refresh token: No refresh token available.")
         return False
 
-    try:
-        session = fyersModel.SessionModel(
-            client_id=CLIENT_ID,
-            redirect_uri=REDIRECT_URI,
-            response_type="code",
-            state="refresh_state",
-            secret_key=SECRET_KEY,
-            grant_type="refresh_token"
-        )
-        session.set_token(REFRESH_TOKEN)  # Set the refresh token
+    session = fyersModel.SessionModel(
+        client_id=CLIENT_ID,
+        redirect_uri=REDIRECT_URI,
+        response_type="code",  # Even for refresh token, this is part of SessionModel init
+        state="refresh_state",
+        secret_key=SECRET_KEY,
+        grant_type="refresh_token"  # This is the key for refreshing
+    )
+    session.set_token(REFRESH_TOKEN)  # Set the refresh token
 
-        app.logger.info(f"Attempting to refresh access token using refresh token: {REFRESH_TOKEN[:8]}...")
+    try:
+        app.logger.info(f"Attempting to refresh access token using refresh token: {REFRESH_TOKEN[:5]}...")
         response = session.generate_token()
 
-        # Validate response; adjust depending on SDK
         if response and response.get("s") == "ok":
-            new_access_token = response.get("access_token")
-            new_refresh_token = response.get("refresh_token", REFRESH_TOKEN)
-
-            if not new_access_token:
-                app.logger.error(f"Refresh response did not contain access_token. Response: {response}")
-                return False
+            new_access_token = response["access_token"]
+            new_refresh_token = response.get("refresh_token", REFRESH_TOKEN)  # Fyers might issue new refresh token, or keep old
 
             store_tokens(new_access_token, new_refresh_token)
-            # Re-init fyers model
-            try:
-                initialize_fyers_model(new_access_token)
-            except Exception:
-                app.logger.warning("FyersModel init failed after refresh; continuing but API calls may fail.")
+            initialize_fyers_model(new_access_token)  # Re-initialize Fyers model with new access token
             app.logger.info("Access token refreshed successfully.")
             return True
         else:
@@ -171,46 +146,80 @@ def refresh_access_token():
         app.logger.error(f"Error during access token refresh: {e}", exc_info=True)
         return False
 
-# Try initialize at startup using whatever tokens we have
+# Initialize Fyers model at startup
 initialize_fyers_model()
 
-# --- Helper wrapper to call fyers methods with token refresh retry ---
-def make_fyers_api_call(api_method, *args, **kwargs):
+# --- Helper: resolution parsing and validation ---
+# Acceptable resolution formats:
+#  - Seconds: "1S", "5S", "10S", "15S", "30S", etc. (case-insensitive)
+#  - Minutes: "1", "5", "15", "30", "60" (these are minute counts represented as digits)
+#  - Days / D: "D", "1D" (daily)
+#  - Weeks: "W", "1W" (weekly)
+#  - Months: "M", "1M" (monthly)
+#
+# This function converts a given resolution string to seconds for candle-completeness logic.
+SUPPORTED_SECOND_RESOLUTIONS = {1, 2, 3, 4, 5, 10, 15, 20, 30}  # commonly used second resolutions
+SUPPORTED_MINUTE_RESOLUTIONS = {1, 2, 3, 5, 10, 15, 30, 60}  # minute resolutions
+# We'll accept weekly and monthly for high-level groupings
+def parse_resolution_to_seconds(resolution):
     """
-    Calls an SDK method (bound function) and automatically attempts token refresh if
-    the error indicates authentication/token expiry. Returns the SDK result or a Flask-style
-    (response, status_code) tuple for errors to be returned upstream.
+    Parse resolution string and return resolution length in seconds.
+    Returns integer seconds if recognized, otherwise None.
+    Accept examples: "5S", "5s", "1", "5", "15", "D", "1D", "W", "M", "1W", "1M"
     """
-    global fyers_instance
-    if not fyers_instance:
-        app.logger.warning("Fyers API not initialized. Attempting to initialize.")
-        if not initialize_fyers_model():
-            return jsonify({"error": "Fyers API not initialized. Please authenticate first."}), 401
+    if not resolution or not isinstance(resolution, str):
+        return None
 
-    try:
-        # Some SDK methods expect named argument 'data' or none; caller supplies appropriate args/kwargs.
-        result = api_method(*args, **kwargs)
-        return result
-    except Exception as e:
-        error_message = str(e).lower()
-        app.logger.warning(f"Fyers API call error: {e}")
-        # Token/ auth detection heuristics
-        if any(k in error_message for k in ("token", "authenticated", "login", "invalid_access_token", "401")):
-            app.logger.warning(f"Access token expired or invalid. Attempting to refresh. Original error: {e}")
-            if refresh_access_token():
-                app.logger.info("Token refreshed, retrying original request.")
-                try:
-                    result = api_method(*args, **kwargs)
-                    return result
-                except Exception as e2:
-                    app.logger.error(f"Retry after token refresh failed: {e2}", exc_info=True)
-                    return jsonify({"error": f"Fyers API error after token refresh: {str(e2)}"}), 500
-            else:
-                app.logger.error("Token refresh failed. Cannot fulfill request.")
-                return jsonify({"error": "Fyers API token expired and refresh failed. Please re-authenticate."}), 401
-        else:
-            app.logger.error(f"Non-token related Fyers API error: {e}", exc_info=True)
-            return jsonify({"error": f"Fyers API error: {str(e)}"}), 500
+    r = resolution.strip().upper()
+
+    # Seconds ending with 'S' (e.g., '5S', '1S')
+    if r.endswith("S"):
+        num_part = r[:-1]
+        try:
+            seconds = int(num_part)
+            if seconds <= 0:
+                return None
+            # Optionally restrict to supported seconds; allow others but warn
+            if seconds not in SUPPORTED_SECOND_RESOLUTIONS:
+                app.logger.debug(f"Resolution {seconds} seconds is not in the common list but will be accepted.")
+            return seconds
+        except ValueError:
+            return None
+
+    # Days / Weekly / Monthly
+    if r in ("D", "1D"):
+        return 24 * 60 * 60
+    if r in ("W", "1W"):
+        return 7 * 24 * 60 * 60
+    if r in ("M", "1M"):
+        # For monthly we use 30 days as a reasonable approximation for candle boundary calculations
+        return 30 * 24 * 60 * 60
+
+    # Minute-based numeric strings (e.g., "1", "5", "15")
+    # Also handle hours provided as "60" (which is minutes)
+    if r.isdigit():
+        try:
+            minutes = int(r)
+            if minutes <= 0:
+                return None
+            # Convert minutes to seconds
+            seconds = minutes * 60
+            # Optionally validate common minute buckets
+            if minutes not in SUPPORTED_MINUTE_RESOLUTIONS and minutes < 1440:
+                app.logger.debug(f"Minute resolution {minutes} is not in common set but will be accepted.")
+            return seconds
+        except ValueError:
+            return None
+
+    # If we reach here, unknown format
+    return None
+
+def is_resolution_supported(resolution):
+    """
+    Returns True if the resolution string is supported for history calls.
+    We accept second-level, minute-level, daily, weekly, monthly.
+    """
+    return parse_resolution_to_seconds(resolution) is not None
 
 # --- Fyers Authentication Flow Endpoints ---
 
@@ -228,7 +237,7 @@ def fyers_login():
         client_id=CLIENT_ID,
         redirect_uri=REDIRECT_URI,
         response_type="code",
-        state="fyers_proxy_state",
+        state="fyers_proxy_state",  # Use a unique state for security if needed
         secret_key=SECRET_KEY,
         grant_type="authorization_code"
     )
@@ -266,15 +275,12 @@ def fyers_auth_callback():
         response = session.generate_token()
 
         if response and response.get("s") == "ok":
-            new_access_token = response.get("access_token")
-            new_refresh_token = response.get("refresh_token")
+            new_access_token = response["access_token"]
+            new_refresh_token = response["refresh_token"]  # Get the refresh token here
 
-            if not new_access_token or not new_refresh_token:
-                app.logger.error(f"Token generation response missing token(s): {response}")
-                return jsonify({"error": "Token response incomplete from Fyers."}), 500
+            store_tokens(new_access_token, new_refresh_token)  # Store both tokens
+            initialize_fyers_model(new_access_token)  # Re-initialize with the new access token
 
-            store_tokens(new_access_token, new_refresh_token)
-            initialize_fyers_model(new_access_token)
             app.logger.info("Fyers tokens generated successfully!")
             return jsonify({"message": "Fyers tokens generated successfully!", "access_token_available": True})
         else:
@@ -287,6 +293,37 @@ def fyers_auth_callback():
 
 
 # --- Fyers Data Endpoints with Token Refresh Logic ---
+
+# Helper function to wrap Fyers API calls with refresh logic
+def make_fyers_api_call(api_method, *args, **kwargs):
+    global fyers_instance
+    if not fyers_instance:
+        app.logger.warning("Fyers API not initialized. Attempting to initialize.")
+        if not initialize_fyers_model():
+            # If initialization (including refresh) fails, we can't proceed
+            return jsonify({"error": "Fyers API not initialized. Please authenticate first."}), 401
+
+    try:
+        return api_method(*args, **kwargs)
+    except Exception as e:  # Catch a general exception
+        error_message = str(e).lower()
+        # Check for keywords that indicate token issues
+        if any(k in error_message for k in ("token", "authenticated", "login", "invalid_access_token", "access token")):
+            app.logger.warning(f"Access token expired or invalid. Attempting to refresh. Original error: {e}")
+            if refresh_access_token():
+                app.logger.info("Token refreshed, retrying original request.")
+                # After successful refresh, fyers_instance is re-initialized with new token
+                try:
+                    return api_method(*args, **kwargs)  # Retry the call
+                except Exception as ex2:
+                    app.logger.error(f"Retry after refresh failed: {ex2}", exc_info=True)
+                    return jsonify({"error": f"Fyers API error after token refresh: {str(ex2)}"}), 500
+            else:
+                app.logger.error("Token refresh failed. Cannot fulfill request.")
+                return jsonify({"error": "Fyers API token expired and refresh failed. Please re-authenticate."}), 401
+        else:
+            app.logger.error(f"Non-token related Fyers API error: {e}", exc_info=True)
+            return jsonify({"error": f"Fyers API error: {str(e)}"}), 500
 
 @app.route('/api/fyers/profile')
 def get_profile():
@@ -309,23 +346,19 @@ def get_holdings():
         return result
     return jsonify(result)
 
-# --- History endpoint that supports seconds-level resolution ---
 @app.route('/api/fyers/history', methods=['POST'])
 def get_history():
     """
-    Expected JSON body:
-    {
-      "symbol": "NSE:RELIANCE-EQ",
-      "resolution": "1S" or "5S" or "1" or "5" or "D",
-      "date_format": 0 (epoch seconds) or 1 (yyyy-mm-dd),
-      "range_from": <int or string>,
-      "range_to": <int or string>,
-      optional: "cont_flag", "oi_flag"
-    }
-
-    This endpoint ensures that when resolution is seconds-level (ends with 'S' or 's'),
-    the requested range_to will be truncated to the last *complete* candle so that
-    the Fyers history call returns only full candles (avoids partial candle at current time).
+    Body JSON required keys:
+      - symbol (string, e.g. "NSE:RELIANCE-EQ")
+      - resolution (string, e.g. "5S", "1", "5", "15", "D", "W", "M")
+      - date_format (0 for epoch seconds, 1 for yyyy-mm-dd)
+      - range_from (int/string) (if date_format=0, epoch seconds; else date string)
+      - range_to (int/string) (if date_format=0, epoch seconds; else date string)
+      Optional:
+      - cont_flag (0/1)
+      - oi_flag (0/1)
+    This endpoint now supports second-level candles like '5S' down to '1S'.
     """
     data = request.json
 
@@ -334,94 +367,83 @@ def get_history():
         app.logger.warning(f"Missing required parameters for history API. Received: {data}")
         return jsonify({"error": f"Missing required parameters for history API. Need {', '.join(required_params)}."}), 400
 
-    # Normalize types
+    # Normalize resolution to string
+    resolution = str(data.get("resolution", "")).strip()
+    if not is_resolution_supported(resolution):
+        app.logger.warning(f"Unsupported or invalid resolution received: {resolution}")
+        return jsonify({"error": f"Unsupported resolution '{resolution}'. Supported examples: '1S','5S','10S','1','5','15','30','60','D','W','M'."}), 400
+
+    # date_format: 0 -> epoch seconds; 1 -> yyyy-mm-dd
     try:
-        date_format = int(data["date_format"])
+        data["date_format"] = int(data["date_format"])
     except Exception:
         app.logger.warning(f"Invalid 'date_format' received: {data.get('date_format')}")
-        return jsonify({"error": "Invalid 'date_format'. Must be 0 or 1."}), 400
+        return jsonify({"error": "Invalid 'date_format'. Must be 0 (epoch seconds) or 1 (yyyy-mm-dd)."}), 400
 
-    resolution = str(data["resolution"]).strip()
-    # Allow numeric minute strings as well (e.g., "1", "5") and 'S' suffix for seconds ('1S','5S')
-    # Also allow lowercase 's'
-    try:
-        range_from = int(str(data["range_from"]))
-        range_to = int(str(data["range_to"]))
-    except Exception:
-        app.logger.warning(f"Invalid 'range_from' or 'range_to' values: {data.get('range_from')}, {data.get('range_to')}")
-        return jsonify({"error": "'range_from' and 'range_to' must be epoch integers when date_format==0."}), 400
+    # If date_format is epoch (0) we will apply candle completeness adjustment
+    if data["date_format"] == 0:
+        try:
+            current_time = int(time.time())
+            requested_range_to = int(data["range_to"])
+            requested_range_from = int(data["range_from"])
+        except Exception:
+            app.logger.warning("When using date_format=0, 'range_from' and 'range_to' should be epoch seconds integers.")
+            return jsonify({"error": "When using date_format=0, 'range_from' and 'range_to' must be epoch seconds (integers)."}), 400
 
-    # Only adjust partial-candle logic when date_format==0 (epoch seconds)
-    if date_format == 0:
-        current_time = int(time.time())
-        resolution_in_seconds = None
+        # Get resolution length in seconds
+        resolution_in_seconds = parse_resolution_to_seconds(resolution)
+        if resolution_in_seconds is None:
+            # This should not happen because we validated earlier, but keep defensive
+            app.logger.error(f"Could not parse resolution to seconds unexpectedly: {resolution}")
+            return jsonify({"error": "Unexpected resolution parsing failure."}), 400
 
-        # Recognize seconds resolution: e.g., '1S', '5S', '30S'
-        if resolution.lower().endswith('s'):
-            # strip the last char and parse the numeric part
-            numeric_part = resolution[:-1]
-            try:
-                resolution_in_seconds = int(numeric_part)
-            except ValueError:
-                app.logger.warning(f"Invalid numeric part in seconds resolution: {resolution}")
-                return jsonify({"error": "Invalid seconds resolution format. Use e.g. '1S', '5S', '15S'."}), 400
-        elif resolution.isdigit():
-            # resolution in minutes, convert to seconds
-            resolution_in_seconds = int(resolution) * 60
-        elif resolution in ["D", "1D", "d", "1d"]:
-            resolution_in_seconds = 24 * 60 * 60
+        # For resolutions that are large (weekly/monthly) we still calculate boundaries.
+        # Calculate the start epoch of the current *incomplete* candle:
+        if resolution_in_seconds >= (24 * 60 * 60):
+            # For daily+ resolutions, align to UTC day boundaries (00:00 UTC)
+            # For weekly align to Monday 00:00 UTC, and for monthly align to first of month 00:00 UTC.
+            # We'll approximate by calculating the last full multiple of the resolution length.
+            current_resolution_start_epoch = (current_time // resolution_in_seconds) * resolution_in_seconds
         else:
-            # Some SDKs accept formats like "1m", "5m" — handle potential 'm' suffix
-            if resolution.lower().endswith('m'):
-                try:
-                    resolution_in_seconds = int(resolution[:-1]) * 60
-                except ValueError:
-                    app.logger.warning(f"Invalid minute resolution format: {resolution}")
-                    return jsonify({"error": "Invalid minute resolution format. Use e.g. '1', '5', '1m', or seconds '1S'."}), 400
-            else:
-                app.logger.warning(f"Unsupported resolution format for partial candle adjustment: {resolution}")
-                return jsonify({"error": "Unsupported resolution format."}), 400
-
-        # Safety check
-        if resolution_in_seconds and resolution_in_seconds > 0:
-            # Calculate the epoch start of the current incomplete candle
+            # For seconds/minutes: compute by simple integer division
             current_resolution_start_epoch = (current_time // resolution_in_seconds) * resolution_in_seconds
 
-            # If the requested range_to includes or goes past the start of the current incomplete candle,
-            # adjust `range_to` to the end of the last *complete* candle (one second before current candle start).
-            if range_to >= current_resolution_start_epoch:
-                adjusted_range_to_epoch = current_resolution_start_epoch - 1
+        # If the requested `range_to` includes or goes past the start of the current incomplete candle,
+        # adjust `range_to` to the end of the *last complete* candle (one second before current_resolution_start_epoch).
+        if requested_range_to >= current_resolution_start_epoch:
+            adjusted_range_to_epoch = current_resolution_start_epoch - 1
 
-                # If adjustment makes the range invalid, return "no complete candles"
-                if adjusted_range_to_epoch < range_from:
-                    app.logger.info(f"Adjusted range_to ({adjusted_range_to_epoch}) is less than range_from ({range_from}). No complete candles available for resolution {resolution} in this range after adjustment.")
-                    return jsonify({"candles": [], "s": "ok", "message": "No complete candles available for the adjusted range."})
-                # Update the request payload
-                data["range_to"] = str(adjusted_range_to_epoch)
-                app.logger.info(f"Adjusted 'range_to' for resolution '{resolution}' to ensure completed candles: {range_to} -> {data['range_to']}")
+            # Ensure the adjusted range_to is not before range_from
+            if adjusted_range_to_epoch < requested_range_from:
+                app.logger.info(f"Adjusted range_to ({adjusted_range_to_epoch}) is less than range_from ({requested_range_from}). No complete candles available for resolution {resolution} in this range after adjustment.")
+                return jsonify({"candles": [], "s": "ok", "message": "No complete candles available for the adjusted range."})
 
-    # Convert optional flags to ints if present
+            # Set the adjusted value back into the data payload as a string (the SDK often expects string values)
+            data["range_to"] = str(adjusted_range_to_epoch)
+            app.logger.info(f"Adjusted 'range_to' for resolution '{resolution}' to ensure completed candles: {requested_range_to} -> {data['range_to']}")
+        else:
+            # No adjustment needed
+            app.logger.debug("No candle completeness adjustment needed for requested range_to.")
+
+    # If optional flags are present, ensure they're correct types
     if "cont_flag" in data:
         try:
             data["cont_flag"] = int(data["cont_flag"])
-        except ValueError:
-            app.logger.warning(f"Invalid cont_flag received: {data.get('cont_flag')}")
+        except Exception:
+            app.logger.warning(f"Invalid cont_flag provided: {data.get('cont_flag')}")
             return jsonify({"error": "Invalid 'cont_flag'. Must be 0 or 1."}), 400
-
     if "oi_flag" in data:
         try:
             data["oi_flag"] = int(data["oi_flag"])
-        except ValueError:
-            app.logger.warning(f"Invalid oi_flag received: {data.get('oi_flag')}")
+        except Exception:
+            app.logger.warning(f"Invalid oi_flag provided: {data.get('oi_flag')}")
             return jsonify({"error": "Invalid 'oi_flag'. Must be 0 or 1."}), 400
 
-    # Finally call the SDK's history method
+    # Finally call the fyers history API via the wrapper (with token refresh handling)
     result = make_fyers_api_call(fyers_instance.history, data=data)
     if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], int):
         return result
     return jsonify(result)
-
-# --- Quotes / Depth / Option Chain endpoints ---
 
 @app.route('/api/fyers/quotes', methods=['GET'])
 def get_quotes():
@@ -489,9 +511,6 @@ def get_option_chain():
         return result
     return jsonify(result)
 
-
-# --- News placeholder ---
-
 @app.route('/api/fyers/news', methods=['GET'])
 def get_news():
     app.logger.info("Accessing placeholder news endpoint.")
@@ -508,7 +527,7 @@ def get_news():
     })
 
 
-# --- Order Placement and Modification APIs ---
+# --- New Order Placement and Modification APIs ---
 
 @app.route('/api/fyers/order', methods=['POST'])
 def place_single_order():
@@ -526,6 +545,7 @@ def place_multi_order():
     if not multi_order_data or not isinstance(multi_order_data, list):
         return jsonify({"error": "An array of order objects is required for multi-order placement."}), 400
 
+    # The fyersModel.multi_order method takes a list of order objects directly
     result = make_fyers_api_call(fyers_instance.multi_order, data=multi_order_data)
     if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], int):
         return result
@@ -557,6 +577,7 @@ def modify_gtt_order():
     if not gtt_modify_data or not gtt_modify_data.get("id"):
         return jsonify({"error": "GTT order ID and modification data are required."}), 400
 
+    # The SDK's modify_gttorder expects the ID and then the modification data
     order_id = gtt_modify_data.pop("id")
     result = make_fyers_api_call(fyers_instance.modify_gttorder, id=order_id, data=gtt_modify_data)
     if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], int):
@@ -588,6 +609,7 @@ def modify_single_order():
     if not modify_data or not modify_data.get("id"):
         return jsonify({"error": "Order ID and modification data are required."}), 400
 
+    # The SDK's modify_order expects the modification data directly
     result = make_fyers_api_call(fyers_instance.modify_order, data=modify_data)
     if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], int):
         return result
@@ -599,6 +621,7 @@ def modify_multi_orders():
     if not modify_basket_data or not isinstance(modify_basket_data, list):
         return jsonify({"error": "An array of order modification objects is required."}), 400
 
+    # The SDK's modify_basket_orders expects a list of order modification objects
     result = make_fyers_api_call(fyers_instance.modify_basket_orders, data=modify_basket_data)
     if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], int):
         return result
@@ -610,6 +633,7 @@ def cancel_single_order():
     if not cancel_data or not cancel_data.get("id"):
         return jsonify({"error": "Order ID is required for cancellation."}), 400
 
+    # The SDK's cancel_order expects the cancellation data directly (which contains 'id')
     result = make_fyers_api_call(fyers_instance.cancel_order, data=cancel_data)
     if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], int):
         return result
@@ -621,6 +645,7 @@ def cancel_multi_orders():
     if not cancel_basket_data or not isinstance(cancel_basket_data, list):
         return jsonify({"error": "An array of order cancellation objects (with 'id') is required."}), 400
 
+    # The SDK's cancel_basket_orders expects a list of cancellation objects
     result = make_fyers_api_call(fyers_instance.cancel_basket_orders, data=cancel_basket_data)
     if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], int):
         return result
@@ -632,6 +657,8 @@ def exit_positions():
     if not exit_data:
         return jsonify({"error": "Request body for exiting positions is required."}), 400
 
+    # The positions API for delete can take different parameters based on intent
+    # This endpoint will be flexible to handle 'exit_all', 'id', or segment/side/productType filters
     result = make_fyers_api_call(fyers_instance.exit_positions, data=exit_data)
     if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], int):
         return result
@@ -648,7 +675,6 @@ def convert_position():
         return result
     return jsonify(result)
 
-
 # --- Margin Calculator APIs ---
 
 @app.route('/api/fyers/margin/span', methods=['POST'])
@@ -657,6 +683,7 @@ def span_margin_calculator():
     if not margin_data or not margin_data.get("data"):
         return jsonify({"error": "An array of order details for span margin calculation is required under 'data' key."}), 400
 
+    # The SDK's span_margin expects 'data' as the key in the payload
     result = make_fyers_api_call(fyers_instance.span_margin, data=margin_data)
     if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], int):
         return result
@@ -668,11 +695,11 @@ def multiorder_margin_calculator():
     if not margin_data or not margin_data.get("data"):
         return jsonify({"error": "An array of order details for multiorder margin calculation is required under 'data' key."}), 400
 
+    # The SDK's multiorder_margin expects 'data' as the key in the payload
     result = make_fyers_api_call(fyers_instance.multiorder_margin, data=margin_data)
     if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], int):
         return result
     return jsonify(result)
-
 
 # --- Broker Config APIs ---
 
@@ -690,18 +717,5 @@ def home():
 
 
 if __name__ == '__main__':
-    # Optionally run a background thread to periodically refresh token (if refresh token expiry is long-lived),
-    # or to save tokens periodically. This is commented out by default.
-    #
-    # def periodic_refresh_task(interval_seconds=60*60):
-    #     while True:
-    #         time.sleep(interval_seconds)
-    #         try:
-    #             if REFRESH_TOKEN:
-    #                 refresh_access_token()
-    #         except Exception as e:
-    #             app.logger.warning(f"Periodic refresh failed: {e}")
-    #
-    # threading.Thread(target=periodic_refresh_task, daemon=True).start()
-
-    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)))
+    # Use host=0.0.0.0 and port 5000 as default
+    app.run(host='0.0.0.0', port=5000)
