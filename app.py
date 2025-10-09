@@ -7,6 +7,8 @@ import datetime
 import time
 import logging
 import json
+# Import the backtesting blueprint
+from backtesting.routes import backtesting_bp
 
 # Load environment variables from .env file (for local development)
 load_dotenv()
@@ -25,6 +27,12 @@ REDIRECT_URI = os.environ.get("FYERS_REDIRECT_URI")
 # These will be updated dynamically and potentially saved persistently
 ACCESS_TOKEN = os.environ.get("FYERS_ACCESS_TOKEN")
 REFRESH_TOKEN = os.environ.get("FYERS_REFRESH_TOKEN")
+
+# Add a base URL for your proxy for internal calls (important for backtesting data fetching)
+# For local development: "http://localhost:5000"
+# For Render deployment: Your Render service URL (e.g., "https://your-fyers-proxy.onrender.com")
+app.config["FYERS_PROXY_BASE_URL"] = os.environ.get("FYERS_PROXY_BASE_URL", "http://localhost:5000")
+
 
 if not all([CLIENT_ID, SECRET_KEY, REDIRECT_URI]):
     app.logger.error("ERROR: Fyers API credentials (CLIENT_ID, SECRET_KEY, REDIRECT_URI) are not fully set. Please check your .env file or environment variables.")
@@ -587,6 +595,8 @@ def get_market_status():
 def home():
     return "Fyers API Proxy Server is running! Use /fyers-login to authenticate or /api/fyers/news for news (placeholder)."
 
+# Register the backtesting blueprint
+app.register_blueprint(backtesting_bp)
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
