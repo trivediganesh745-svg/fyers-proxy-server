@@ -4,6 +4,9 @@ python-dotenv
 gunicorn
 Flask-Cors
 google-generativeai
-requests # Added as it's often useful for external API calls, even if placeholders
+requests
 flask-sock
 simple-websocket
+pandas # For data handling in backtesting
+numpy # For numerical operations in backtesting
+TA-Lib # For technical analysis indicators
