@@ -10,3 +10,4 @@ simple-websocket
 pandas
 numpy
 TA-Lib
+setuptools>=68.0.0
