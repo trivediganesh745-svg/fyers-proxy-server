@@ -1,20 +1,29 @@
 import os
 from flask import Flask, request, jsonify, redirect, url_for
 from fyers_apiv3 import fyersModel
+# New import for the Fyers websocket client
+from fyers_apiv3.FyersWebsocket import data_ws
 from dotenv import load_dotenv
 from flask_cors import CORS
 import datetime
 import time
 import logging
 import json
-# Import the backtesting blueprint
+import threading
 from backtesting.routes import backtesting_bp
+
+# New imports for Flask WebSocket support
+from flask_sock import Sock
+from typing import List
 
 # Load environment variables from .env file (for local development)
 load_dotenv()
 
 app = Flask(__name__)
-CORS(app) # Enable CORS for all routes
+CORS(app)  # Enable CORS for all routes
+
+# Initialize Sock for client-facing websocket connections
+sock = Sock(app)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -54,8 +63,14 @@ def store_tokens(access_token, refresh_token):
     REFRESH_TOKEN = refresh_token
     
     app.logger.info("Tokens updated. For persistence, save these securely:")
-    app.logger.info(f"New Access Token: {ACCESS_TOKEN[:10]}...")
-    app.logger.info(f"New Refresh Token: {REFRESH_TOKEN[:10]}...")
+    try:
+        app.logger.info(f"New Access Token: {ACCESS_TOKEN[:10]}...")
+    except Exception:
+        app.logger.info("New Access Token: (hidden)")
+    try:
+        app.logger.info(f"New Refresh Token: {REFRESH_TOKEN[:10]}...")
+    except Exception:
+        app.logger.info("New Refresh Token: (hidden)")
     
     # Example of saving to a file (simple, but not recommended for production security)
     # with open("tokens.json", "w") as f:
@@ -85,9 +100,18 @@ def initialize_fyers_model(token=None):
     token_to_use = token if token else ACCESS_TOKEN
 
     if token_to_use:
-        fyers_instance = fyersModel.FyersModel(token=token_to_use, is_async=False, client_id=CLIENT_ID, log_path="")
-        app.logger.info("FyersModel initialized with access token.")
-        return True
+        # Note: fyersModel.FyersModel expects 'token' arg name in some versions
+        try:
+            # keep backward compatibility: some versions use token= or access_token=
+            try:
+                fyers_instance = fyersModel.FyersModel(token=token_to_use, is_async=False, client_id=CLIENT_ID, log_path="")
+            except TypeError:
+                fyers_instance = fyersModel.FyersModel(access_token=token_to_use, is_async=False, client_id=CLIENT_ID, log_path="")
+            app.logger.info("FyersModel initialized with access token.")
+            return True
+        except Exception as e:
+            app.logger.error(f"Failed to initialize fyers_model with provided token: {e}", exc_info=True)
+            return False
     elif REFRESH_TOKEN and CLIENT_ID and SECRET_KEY:
         app.logger.info("No access token provided or found, attempting to use refresh token.")
         # Attempt to refresh using the refresh token
@@ -591,6 +615,342 @@ def get_market_status():
     return jsonify(result)
 
 
+# -----------------------------
+# WebSocket Integration Section
+# -----------------------------
+
+# GLOBALS for data socket management
+_fyers_data_socket = None
+_fyers_socket_thread = None
+_connected_clients = []  # stores ws objects for broadcasting
+_subscribed_symbols = set()
+_socket_lock = threading.Lock()
+_socket_running = False
+
+def _create_data_socket(access_token, lite_mode=False, write_to_file=False, reconnect=True, reconnect_retry=10):
+    """
+    Create a FyersDataSocket instance with callbacks wired to broadcast incoming messages
+    to connected frontend websocket clients.
+    """
+    global _fyers_data_socket
+
+    def _on_connect():
+        app.logger.info("Fyers DataSocket connected.")
+        # If we already had subscriptions, re-subscribe
+        if _subscribed_symbols:
+            try:
+                _fyers_data_socket.subscribe(symbols=list(_subscribed_symbols), data_type="SymbolUpdate")
+                app.logger.info(f"Re-subscribed to symbols on connect: {_subscribed_symbols}")
+            except Exception as e:
+                app.logger.error(f"Error re-subscribing on connect: {e}", exc_info=True)
+
+    def _on_message(message):
+        """
+        Called for incoming socket messages from Fyers. Broadcast to all connected clients.
+        Message is expected to be a dict (SDK provides dict) or JSON string.
+        """
+        try:
+            # Ensure it's JSON serializable
+            if isinstance(message, str):
+                payload = message
+            else:
+                payload = json.dumps(message, default=str)
+        except Exception:
+            payload = str(message)
+
+        # Broadcast to connected frontend websocket clients
+        with _socket_lock:
+            to_remove = []
+            for client in _connected_clients:
+                try:
+                    client.send(payload)
+                except Exception as e:
+                    app.logger.debug(f"Failed to send to one client: {e}")
+                    # mark for removal
+                    to_remove.append(client)
+            # remove disconnected clients
+            for r in to_remove:
+                try:
+                    _connected_clients.remove(r)
+                except ValueError:
+                    pass
+
+    def _on_error(error):
+        app.logger.error(f"Fyers DataSocket error: {error}")
+
+    def _on_close(close_msg):
+        app.logger.info(f"Fyers DataSocket closed: {close_msg}")
+
+    # Instantiate the data socket using SDK's data_ws.FyersDataSocket
+    try:
+        _fyers_data_socket = data_ws.FyersDataSocket(
+            access_token=access_token,
+            log_path="",
+            litemode=lite_mode,
+            write_to_file=write_to_file,
+            reconnect=reconnect,
+            on_connect=_on_connect,
+            on_close=_on_close,
+            on_error=_on_error,
+            on_message=_on_message,
+            reconnect_retry=reconnect_retry
+        )
+        return _fyers_data_socket
+    except Exception as e:
+        app.logger.error(f"Failed to create FyersDataSocket: {e}", exc_info=True)
+        return None
+
+def _start_data_socket_in_thread(access_token):
+    """
+    Starts the Fyers DataSocket in a dedicated daemon thread if not already running.
+    """
+    global _fyers_socket_thread, _socket_running, _fyers_data_socket
+
+    with _socket_lock:
+        if _socket_running:
+            app.logger.info("Fyers DataSocket already running; skip start.")
+            return True
+
+        # create socket instance
+        _fyers_data_socket = _create_data_socket(access_token)
+        if not _fyers_data_socket:
+            app.logger.error("Could not create Fyers DataSocket instance.")
+            return False
+
+        def _run():
+            global _socket_running
+            try:
+                _socket_running = True
+                app.logger.info("Starting Fyers DataSocket.connect() (blocking call in thread).")
+                # This will block while socket is running; SDK will handle reconnects internally
+                _fyers_data_socket.connect()
+            except Exception as e:
+                app.logger.error(f"Fyers DataSocket thread crashed: {e}", exc_info=True)
+            finally:
+                _socket_running = False
+                app.logger.info("Fyers DataSocket thread stopped.")
+
+        _fyers_socket_thread = threading.Thread(target=_run, daemon=True, name="FyersDataSocketThread")
+        _fyers_socket_thread.start()
+        app.logger.info("Fyers DataSocket thread started.")
+        return True
+
+def _ensure_data_socket_running():
+    """
+    Ensures the socket is running; if not, try to start it with current ACCESS_TOKEN.
+    """
+    global ACCESS_TOKEN
+    if not ACCESS_TOKEN:
+        app.logger.warning("ACCESS_TOKEN is not available; cannot start data socket.")
+        return False
+    return _start_data_socket_in_thread(ACCESS_TOKEN)
+
+# Client-facing websocket route
+@sock.route('/ws/fyers')
+def ws_fyers(ws):
+    """
+    Frontend connects here: wss://<host>/ws/fyers
+    Supported incoming JSON messages from frontend:
+      - {"action": "subscribe", "symbols": ["NSE:SBIN-EQ","NSE:TCS-EQ"], "data_type":"SymbolUpdate"}
+      - {"action": "unsubscribe", "symbols": ["NSE:SBIN-EQ"]}
+      - {"action": "mode", "lite": true}  # switch to lite mode (ltp only)
+      - {"action": "status"}  # asks server to reply with socket status
+    The server will broadcast any incoming Fyers socket messages to all connected clients.
+    """
+    global _connected_clients, _subscribed_symbols, _fyers_data_socket, ACCESS_TOKEN
+
+    # Register client
+    with _socket_lock:
+        _connected_clients.append(ws)
+    app.logger.info(f"Frontend websocket connected. Total clients: {len(_connected_clients)}")
+
+    try:
+        # Ensure the server-side Fyers socket is running
+        if not _socket_running:
+            started = _ensure_data_socket_running()
+            if not started:
+                err = {"error": "Fyers DataSocket could not be started. Ensure ACCESS_TOKEN is set and valid."}
+                try:
+                    ws.send(json.dumps(err))
+                except Exception:
+                    pass
+                ws.close()
+                return
+
+        # handle client messages
+        while True:
+            # If client disconnected, break (receive returns None)
+            msg = ws.receive()
+            if msg is None:
+                app.logger.info("Frontend websocket disconnected (receive returned None).")
+                break
+
+            try:
+                data = json.loads(msg)
+            except Exception:
+                # Not JSON — ignore but send warning
+                try:
+                    ws.send(json.dumps({"error":"Invalid JSON command"}))
+                except Exception:
+                    pass
+                continue
+
+            action = data.get("action")
+            if action == "subscribe":
+                symbols = data.get("symbols", [])
+                # optional data_type param; default to SymbolUpdate
+                data_type = data.get("data_type", "SymbolUpdate")
+                if not symbols:
+                    try:
+                        ws.send(json.dumps({"error":"No symbols provided for subscribe"}))
+                    except Exception:
+                        pass
+                    continue
+                # update server subscription set
+                with _socket_lock:
+                    for s in symbols:
+                        _subscribed_symbols.add(s)
+                # instruct fyers data socket to subscribe
+                try:
+                    if _fyers_data_socket:
+                        # SDK's subscribe signature varies; support both common forms
+                        try:
+                            _fyers_data_socket.subscribe(symbols=symbols, data_type=data_type)
+                        except TypeError:
+                            # fallback: positional
+                            _fyers_data_socket.subscribe(symbols)
+                        try:
+                            ws.send(json.dumps({"status":"subscribed", "symbols": symbols}))
+                        except Exception:
+                            pass
+                    else:
+                        ws.send(json.dumps({"error":"Internal server: data socket not available"}))
+                except Exception as e:
+                    app.logger.error(f"Error subscribing via fyers socket: {e}", exc_info=True)
+                    try:
+                        ws.send(json.dumps({"error":str(e)}))
+                    except Exception:
+                        pass
+
+            elif action == "unsubscribe":
+                symbols = data.get("symbols", [])
+                data_type = data.get("data_type", "SymbolUpdate")
+                if not symbols:
+                    try:
+                        ws.send(json.dumps({"error":"No symbols provided for unsubscribe"}))
+                    except Exception:
+                        pass
+                    continue
+                # update server subscription set
+                with _socket_lock:
+                    for s in symbols:
+                        _subscribed_symbols.discard(s)
+                try:
+                    if _fyers_data_socket:
+                        try:
+                            _fyers_data_socket.unsubscribe(symbols=symbols, data_type=data_type)
+                        except TypeError:
+                            _fyers_data_socket.unsubscribe(symbols)
+                        try:
+                            ws.send(json.dumps({"status":"unsubscribed", "symbols": symbols}))
+                        except Exception:
+                            pass
+                    else:
+                        ws.send(json.dumps({"error":"Internal server: data socket not available"}))
+                except Exception as e:
+                    app.logger.error(f"Error unsubscribing via fyers socket: {e}", exc_info=True)
+                    try:
+                        ws.send(json.dumps({"error":str(e)}))
+                    except Exception:
+                        pass
+
+            elif action == "mode":
+                # mode change: lite/full
+                lite = data.get("lite", False)
+                try:
+                    # To change mode, we must recreate socket instance (SDK may not expose dynamic switch)
+                    # We'll stop existing socket by disconnecting (if method available) and restart
+                    # Note: SDK's disconnect method name may vary; attempt common patterns.
+                    with _socket_lock:
+                        # Record current symbol subscriptions so we can resubscribe after restart
+                        current_symbols = list(_subscribed_symbols)
+                        # try graceful stop
+                        try:
+                            if _fyers_data_socket:
+                                try:
+                                    _fyers_data_socket.close()
+                                except Exception:
+                                    try:
+                                        _fyers_data_socket.stop()
+                                    except Exception:
+                                        pass
+                        except Exception:
+                            pass
+                        # Create new socket with requested mode
+                        _create_data_socket(access_token=ACCESS_TOKEN, lite_mode=bool(lite))
+                        # Start the socket thread if not running
+                        if not _socket_running:
+                            _start_data_socket_in_thread(ACCESS_TOKEN)
+                        # restore subscriptions
+                        if current_symbols and _fyers_data_socket:
+                            try:
+                                _fyers_data_socket.subscribe(symbols=current_symbols, data_type="SymbolUpdate")
+                            except Exception:
+                                try:
+                                    _fyers_data_socket.subscribe(current_symbols)
+                                except Exception:
+                                    app.logger.debug("Failed to re-subscribe after mode switch.")
+                    ws.send(json.dumps({"status":"mode_changed", "lite": bool(lite)}))
+                except Exception as e:
+                    app.logger.error(f"Error switching mode: {e}", exc_info=True)
+                    try:
+                        ws.send(json.dumps({"error":str(e)}))
+                    except Exception:
+                        pass
+
+            elif action == "status":
+                try:
+                    status = {
+                        "socket_running": bool(_socket_running),
+                        "connected_clients": len(_connected_clients),
+                        "subscribed_symbols": list(_subscribed_symbols)
+                    }
+                    ws.send(json.dumps({"status": status}))
+                except Exception:
+                    pass
+
+            else:
+                # Unknown action: echo or provide usage help
+                try:
+                    ws.send(json.dumps({
+                        "error":"Unknown action",
+                        "usage": [
+                            {"action":"subscribe", "symbols":["NSE:SBIN-EQ"], "data_type":"SymbolUpdate"},
+                            {"action":"unsubscribe", "symbols":["NSE:SBIN-EQ"]},
+                            {"action":"mode", "lite": True},
+                            {"action":"status"}
+                        ]
+                    }))
+                except Exception:
+                    pass
+
+    except Exception as e:
+        app.logger.error(f"Error in ws_fyers handling: {e}", exc_info=True)
+    finally:
+        # Cleanup when client disconnects
+        with _socket_lock:
+            try:
+                _connected_clients.remove(ws)
+            except ValueError:
+                pass
+        app.logger.info(f"Frontend websocket disconnected. Remaining clients: {len(_connected_clients)}")
+
+
+# -----------------------------
+# End WebSocket Integration Section
+# -----------------------------
+
+
 @app.route('/')
 def home():
     return "Fyers API Proxy Server is running! Use /fyers-login to authenticate or /api/fyers/news for news (placeholder)."
@@ -599,4 +959,13 @@ def home():
 app.register_blueprint(backtesting_bp)
 
 if __name__ == '__main__':
+    # Start the Fyers data socket at startup if an access token is present.
+    # This is optional — if you prefer to start on-demand when a client connects, remove this.
+    if ACCESS_TOKEN:
+        try:
+            # Attempt to start the socket in background
+            _start_data_socket_in_thread(ACCESS_TOKEN)
+        except Exception as e:
+            app.logger.warning(f"Could not start Fyers DataSocket at startup: {e}")
+
     app.run(host='0.0.0.0', port=5000)
