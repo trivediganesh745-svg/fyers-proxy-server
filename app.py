@@ -15,6 +15,7 @@ from backtesting.routes import backtesting_bp
 # New imports for Flask WebSocket support
 from flask_sock import Sock
 from typing import List
+import math
 
 # Load environment variables from .env file (for local development)
 load_dotenv()
@@ -415,6 +416,248 @@ def get_option_chain():
         return result
     return jsonify(result)
 
+# ---------------------------
+# BEGIN: New helper + endpoints
+# ---------------------------
+
+def _find_option_in_chain(resp, option_symbol=None, strike=None, opt_type=None, expiry_ts=None):
+    """
+    Helper to search option chain response for the requested option and return the node.
+    Accepts either full `option_symbol` (like "NSE:NIFTY25DEC17500CE") OR strike/opt_type/expiry_ts.
+    Returns the option dict or None.
+    """
+    if not resp or not isinstance(resp, dict):
+        return None
+
+    # common places SDK returns chain: data -> optionChain or data -> filtered
+    data = resp.get("data") if isinstance(resp, dict) else None
+    # Try multiple common shapes
+    candidates = []
+    if data is None and "options_chain" in resp:
+        data = resp
+
+    # Flatten common structures
+    if isinstance(data, dict):
+        # some SDKs return data['option_chain'] or data['options']
+        for key in ["optionChain", "option_chain", "optionsChain", "options", "ce", "pe"]:
+            node = data.get(key)
+            if node:
+                # node could be list or dict
+                if isinstance(node, list):
+                    candidates.extend(node)
+                elif isinstance(node, dict):
+                    # dict of strikes
+                    for v in node.values():
+                        if isinstance(v, list):
+                            candidates.extend(v)
+                        else:
+                            candidates.append(v)
+
+    # fallback: top-level 'data' might be list of strikes
+    if not candidates and isinstance(resp.get("data"), list):
+        candidates.extend(resp.get("data"))
+
+    # final fallback: resp itself is a list
+    if not candidates and isinstance(resp, list):
+        candidates.extend(resp)
+
+    # normalize and search
+    for item in candidates:
+        try:
+            symbol = item.get("symbol") or item.get("s") or item.get("name")
+        except Exception:
+            symbol = None
+        if option_symbol and symbol and option_symbol == symbol:
+            return item
+        # match by strike/type
+        try:
+            strike_val = item.get("strike") or item.get("strike_price") or item.get("strikePrice")
+            typ = item.get("option_type") or item.get("type") or item.get("opt_type") or item.get("instrument_type")
+            expiry = item.get("expiry") or item.get("expiry_date") or item.get("expiry_ts")
+        except Exception:
+            strike_val = None
+            typ = None
+            expiry = None
+
+        if strike is not None and strike_val is not None:
+            # numeric compare
+            try:
+                if int(float(strike_val)) == int(float(strike)):
+                    if not opt_type or (typ and opt_type.upper() in str(typ).upper()):
+                        return item
+            except Exception:
+                pass
+
+        if expiry_ts and expiry:
+            try:
+                if int(expiry_ts) == int(expiry):
+                    if not strike or (strike_val and int(float(strike_val)) == int(float(strike))):
+                        return item
+            except Exception:
+                pass
+
+    return None
+
+
+@app.route('/api/fyers/option_premium', methods=['GET'])
+def get_option_premium():
+    """
+    Returns option premium (LTP), IV, OI, change, and a small parsed payload for a single option contract.
+    Query params (one of the following ways):
+      - symbol=<FULL_OPTION_SYMBOL>  (e.g. NSE:NIFTY25DEC17500CE)
+      - underlying=<UNDERLYING_SYMBOL>&strike=<STRIKE>&type=<CE|PE>&expiry_ts=<EPOCH>
+
+    Example:
+      GET /api/fyers/option_premium?symbol=NSE:NIFTY25DEC17500CE
+      GET /api/fyers/option_premium?underlying=NSE:NIFTY50-INDEX&strike=17500&type=CE
+    """
+    symbol = request.args.get('symbol')
+    underlying = request.args.get('underlying')
+    strike = request.args.get('strike')
+    opt_type = request.args.get('type')  # CE or PE
+    expiry_ts = request.args.get('expiry_ts')
+
+    # Prefer symbol if provided
+    if not symbol and not (underlying and strike and opt_type):
+        return jsonify({"error": "Provide either symbol=<OPTION_SYMBOL> OR underlying=<SYM>&strike=<STRIKE>&type=<CE|PE>"}), 400
+
+    try:
+        # If full option symbol given, try depth call first (g faster for single symbol)
+        if symbol:
+            # Try market depth first (gives LTP, bids/asks, oi)
+            depth_resp = make_fyers_api_call(fyers_instance.depth, data={"symbol": symbol, "ohlcv_flag": 1})
+            # if depth_resp looks like a flask tuple error, return it
+            if isinstance(depth_resp, tuple) and len(depth_resp) == 2 and isinstance(depth_resp[1], int):
+                return depth_resp
+
+            # depth_resp usually contains 'data' or direct fields
+            premium = None
+            try:
+                # Many depth responses include 'ltp' or 'last_price' in data
+                d = depth_resp.get('data') if isinstance(depth_resp, dict) else None
+                if d:
+                    premium = d.get('ltp') or d.get('last_price') or d.get('close')
+                if not premium and isinstance(depth_resp, dict):
+                    premium = depth_resp.get('ltp') or depth_resp.get('last_price')
+            except Exception:
+                premium = None
+
+            # fallback: fetch option chain for symbol
+            if premium is None:
+                oc_resp = make_fyers_api_call(fyers_instance.optionchain, data={"symbol": symbol, "strikecount": 1})
+                if isinstance(oc_resp, tuple) and len(oc_resp) == 2 and isinstance(oc_resp[1], int):
+                    return oc_resp
+                found = _find_option_in_chain(oc_resp, option_symbol=symbol)
+                node = found or (oc_resp if isinstance(oc_resp, dict) else None)
+            else:
+                node = depth_resp if isinstance(depth_resp, dict) else None
+
+        else:
+            # Build the approximate option symbol if SDK requires underlying symbol style
+            # Some SDKs accept underlying in optionchain calls and return full data
+            oc_resp = make_fyers_api_call(fyers_instance.optionchain, data={"symbol": underlying, "strikecount": 50})
+            if isinstance(oc_resp, tuple) and len(oc_resp) == 2 and isinstance(oc_resp[1], int):
+                return oc_resp
+            # Try to find by strike & type
+            found = _find_option_in_chain(oc_resp, strike=strike, opt_type=opt_type, expiry_ts=expiry_ts)
+            node = found
+
+        if not node:
+            return jsonify({"error": "Option contract not found in Fyers response.", "symbol": symbol or f"{underlying}:{strike}{opt_type if opt_type else ''}"}), 404
+
+        # Extract common fields safely
+        ltp = node.get('ltp') or node.get('last_price') or node.get('close')
+        oi = node.get('oi') or node.get('open_interest') or node.get('openInterest')
+        iv = node.get('iv') or node.get('implied_volatility') or node.get('impliedVol')
+        change = node.get('change') or node.get('price_change') or node.get('p_change')
+        bid = node.get('bid') or node.get('best_bid')
+        ask = node.get('ask') or node.get('best_ask')
+
+        response = {
+            "symbol": symbol or node.get('symbol'),
+            "ltp": ltp,
+            "premium": ltp,
+            "iv": iv,
+            "oi": oi,
+            "change": change,
+            "bid": bid,
+            "ask": ask,
+            "raw": node
+        }
+        return jsonify(response)
+
+    except Exception as e:
+        app.logger.error(f"Error in option_premium endpoint: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/fyers/option_chain_depth', methods=['GET'])
+def get_option_chain_depth():
+    """
+    Returns detailed market depth for a chosen option contract. Accepts either:
+      - symbol=<FULL_OPTION_SYMBOL>
+      - underlying & strike & type (CE/PE) & optional expiry_ts
+
+    This endpoint will call the SDK depth API and also include a small context with the option chain around the strike.
+    """
+    symbol = request.args.get('symbol')
+    underlying = request.args.get('underlying')
+    strike = request.args.get('strike')
+    opt_type = request.args.get('type')
+    expiry_ts = request.args.get('expiry_ts')
+
+    try:
+        if symbol:
+            depth_resp = make_fyers_api_call(fyers_instance.depth, data={"symbol": symbol, "ohlcv_flag": 1})
+            if isinstance(depth_resp, tuple) and len(depth_resp) == 2 and isinstance(depth_resp[1], int):
+                return depth_resp
+            # Optionally also fetch the small option chain context (nearby strikes)
+            # Try derive underlying by splitting symbol if possible
+            try:
+                underlying_guess = symbol.split(":")[0] if ":" in symbol else None
+            except Exception:
+                underlying_guess = None
+
+            oc_resp = None
+            try:
+                if underlying_guess:
+                    oc_resp = make_fyers_api_call(fyers_instance.optionchain, data={"symbol": underlying_guess, "strikecount": 10})
+            except Exception:
+                oc_resp = None
+
+            return jsonify({"depth": depth_resp, "option_chain_context": oc_resp})
+
+        # else try to locate the option using optionchain
+        if not (underlying and strike and opt_type):
+            return jsonify({"error": "Provide either symbol=<OPTION_SYMBOL> OR underlying & strike & type parameters."}), 400
+
+        oc_resp = make_fyers_api_call(fyers_instance.optionchain, data={"symbol": underlying, "strikecount": 50})
+        if isinstance(oc_resp, tuple) and len(oc_resp) == 2 and isinstance(oc_resp[1], int):
+            return oc_resp
+
+        found = _find_option_in_chain(oc_resp, strike=strike, opt_type=opt_type, expiry_ts=expiry_ts)
+        if not found:
+            return jsonify({"error": "Option strike not found in option chain response.", "underlying": underlying, "strike": strike, "type": opt_type}), 404
+
+        symbol_to_query = found.get('symbol') or request.args.get('symbol')
+        if not symbol_to_query:
+            return jsonify({"error": "Could not determine option symbol to query depth for."}), 500
+
+        depth_resp = make_fyers_api_call(fyers_instance.depth, data={"symbol": symbol_to_query, "ohlcv_flag": 1})
+        if isinstance(depth_resp, tuple) and len(depth_resp) == 2 and isinstance(depth_resp[1], int):
+            return depth_resp
+
+        return jsonify({"depth": depth_resp, "option_chain_context": oc_resp})
+
+    except Exception as e:
+        app.logger.error(f"Error in option_chain_depth endpoint: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+# ---------------------------
+# END: New helper + endpoints
+# ---------------------------
+
+
 @app.route('/api/fyers/news', methods=['GET'])
 def get_news():
     app.logger.info("Accessing placeholder news endpoint.")
@@ -714,7 +957,7 @@ def _start_data_socket_in_thread(access_token):
         # create socket instance
         _fyers_data_socket = _create_data_socket(access_token)
         if not _fyers_data_socket:
-            app.logger.error("Could not create Fyers DataSocket instance.")
+            app.logger.error("Could not create FyersDataSocket instance.")
             return False
 
         def _run():
