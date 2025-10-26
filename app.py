@@ -40,7 +40,7 @@ REFRESH_TOKEN = os.environ.get("FYERS_REFRESH_TOKEN")
 
 # --- Gemini AI Configuration ---
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-1.5-flash")  # Default to flash model
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")  # Default to flash model
 
 # Add a base URL for your proxy for internal calls
 app.config["FYERS_PROXY_BASE_URL"] = os.environ.get("FYERS_PROXY_BASE_URL", "http://localhost:5000")
