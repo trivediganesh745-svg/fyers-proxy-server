@@ -11,8 +11,12 @@ import json
 import threading
 from backtesting.routes import backtesting_bp
 from flask_sock import Sock
-from typing import List
+from typing import List, Dict, Any
 import math
+import google.generativeai as genai
+from google.generativeai.types import HarmCategory, HarmBlockThreshold
+import asyncio
+import numpy as np
 
 # Load environment variables from .env file (for local development)
 load_dotenv()
@@ -34,6 +38,10 @@ REDIRECT_URI = os.environ.get("FYERS_REDIRECT_URI")
 ACCESS_TOKEN = os.environ.get("FYERS_ACCESS_TOKEN")
 REFRESH_TOKEN = os.environ.get("FYERS_REFRESH_TOKEN")
 
+# --- Gemini AI Configuration ---
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-1.5-flash")  # Default to flash model
+
 # Add a base URL for your proxy for internal calls
 app.config["FYERS_PROXY_BASE_URL"] = os.environ.get("FYERS_PROXY_BASE_URL", "http://localhost:5000")
 
@@ -42,11 +50,239 @@ SECOND_RESOLUTIONS = ["1S", "5S", "10S", "15S", "30S", "45S"]
 MINUTE_RESOLUTIONS = ["1", "2", "3", "5", "10", "15", "20", "30", "60", "120", "240"]
 DAY_RESOLUTIONS = ["1D", "D"]
 
+# Initialize Gemini AI
+gemini_model = None
+if GEMINI_API_KEY:
+    try:
+        genai.configure(api_key=GEMINI_API_KEY)
+        
+        # Configure the model with specific settings
+        generation_config = {
+            "temperature": 0.7,
+            "top_p": 0.95,
+            "top_k": 40,
+            "max_output_tokens": 8192,
+        }
+        
+        safety_settings = {
+            HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
+            HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
+            HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
+            HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
+        }
+        
+        gemini_model = genai.GenerativeModel(
+            model_name=GEMINI_MODEL,
+            generation_config=generation_config,
+            safety_settings=safety_settings
+        )
+        
+        app.logger.info(f"Gemini AI initialized with model: {GEMINI_MODEL}")
+    except Exception as e:
+        app.logger.error(f"Failed to initialize Gemini AI: {e}")
+        gemini_model = None
+else:
+    app.logger.warning("GEMINI_API_KEY not found. AI features will be disabled.")
+
 if not all([CLIENT_ID, SECRET_KEY, REDIRECT_URI]):
     app.logger.error("ERROR: Fyers API credentials (CLIENT_ID, SECRET_KEY, REDIRECT_URI) are not fully set.")
 
 # Initialize FyersModel
 fyers_instance = None 
+
+# --- AI Analysis Functions ---
+
+def analyze_market_data_with_ai(data: Dict[str, Any], analysis_type: str = "general") -> Dict[str, Any]:
+    """
+    Use Gemini AI to analyze market data and provide insights.
+    
+    Args:
+        data: Market data to analyze
+        analysis_type: Type of analysis (general, technical, sentiment, risk)
+    
+    Returns:
+        AI analysis response
+    """
+    if not gemini_model:
+        return {"error": "AI model not initialized"}
+    
+    try:
+        prompts = {
+            "general": f"""
+                Analyze the following market data and provide insights:
+                {json.dumps(data, indent=2)}
+                
+                Please provide:
+                1. Key observations
+                2. Trend analysis
+                3. Risk factors
+                4. Potential opportunities
+                5. Recommended actions
+                
+                Format the response in a clear, structured manner.
+            """,
+            "technical": f"""
+                Perform technical analysis on the following market data:
+                {json.dumps(data, indent=2)}
+                
+                Include:
+                1. Support and resistance levels
+                2. Trend direction and strength
+                3. Volume analysis
+                4. Key technical indicators interpretation
+                5. Entry and exit points
+                
+                Be specific with price levels and percentages.
+            """,
+            "sentiment": f"""
+                Analyze market sentiment based on the following data:
+                {json.dumps(data, indent=2)}
+                
+                Provide:
+                1. Overall market sentiment (bullish/bearish/neutral)
+                2. Sentiment strength (1-10 scale)
+                3. Key sentiment drivers
+                4. Potential sentiment shifts
+                5. Contrarian opportunities
+            """,
+            "risk": f"""
+                Perform risk analysis on the following market data:
+                {json.dumps(data, indent=2)}
+                
+                Include:
+                1. Risk level assessment (low/medium/high)
+                2. Specific risk factors
+                3. Volatility analysis
+                4. Risk mitigation strategies
+                5. Position sizing recommendations
+                
+                Provide specific percentages and thresholds.
+            """
+        }
+        
+        prompt = prompts.get(analysis_type, prompts["general"])
+        response = gemini_model.generate_content(prompt)
+        
+        return {
+            "analysis_type": analysis_type,
+            "analysis": response.text,
+            "timestamp": datetime.datetime.now().isoformat()
+        }
+        
+    except Exception as e:
+        app.logger.error(f"AI analysis error: {e}")
+        return {"error": str(e)}
+
+def generate_trading_signals_with_ai(symbol: str, historical_data: List, current_price: float) -> Dict[str, Any]:
+    """
+    Generate trading signals using AI based on historical data and current price.
+    """
+    if not gemini_model:
+        return {"error": "AI model not initialized"}
+    
+    try:
+        # Prepare data for AI analysis
+        recent_candles = historical_data[-20:] if len(historical_data) > 20 else historical_data
+        
+        prompt = f"""
+        As a trading analyst, generate trading signals for {symbol} based on the following data:
+        
+        Current Price: {current_price}
+        Recent Historical Data (last {len(recent_candles)} candles):
+        {json.dumps(recent_candles, indent=2)}
+        
+        Provide:
+        1. Signal: BUY/SELL/HOLD
+        2. Confidence Level: (0-100%)
+        3. Entry Price
+        4. Stop Loss
+        5. Target Price(s) - provide 3 targets
+        6. Risk-Reward Ratio
+        7. Time Horizon
+        8. Key Reasoning
+        
+        Format as JSON for easy parsing.
+        """
+        
+        response = gemini_model.generate_content(prompt)
+        
+        # Try to parse the response as JSON
+        try:
+            # Extract JSON from the response text
+            response_text = response.text
+            # Find JSON content between ```json and ```
+            import re
+            json_match = re.search(r'```json\s*(.*?)\s*```', response_text, re.DOTALL)
+            if json_match:
+                signal_data = json.loads(json_match.group(1))
+            else:
+                # Try to parse the entire response as JSON
+                signal_data = json.loads(response_text)
+        except:
+            # If JSON parsing fails, return the raw text
+            signal_data = {"raw_analysis": response.text}
+        
+        return {
+            "symbol": symbol,
+            "current_price": current_price,
+            "signals": signal_data,
+            "timestamp": datetime.datetime.now().isoformat()
+        }
+        
+    except Exception as e:
+        app.logger.error(f"AI signal generation error: {e}")
+        return {"error": str(e)}
+
+def calculate_advanced_indicators(candles: List) -> Dict[str, Any]:
+    """
+    Calculate advanced technical indicators for AI analysis.
+    """
+    if not candles or len(candles) < 2:
+        return {}
+    
+    try:
+        # Extract OHLCV data
+        closes = [c[4] for c in candles]  # Close prices
+        highs = [c[2] for c in candles]   # High prices
+        lows = [c[3] for c in candles]    # Low prices
+        volumes = [c[5] for c in candles] if len(candles[0]) > 5 else []
+        
+        # Calculate basic indicators
+        indicators = {
+            "sma_10": np.mean(closes[-10:]) if len(closes) >= 10 else None,
+            "sma_20": np.mean(closes[-20:]) if len(closes) >= 20 else None,
+            "sma_50": np.mean(closes[-50:]) if len(closes) >= 50 else None,
+            "current_price": closes[-1],
+            "price_change": closes[-1] - closes[-2] if len(closes) >= 2 else 0,
+            "price_change_pct": ((closes[-1] - closes[-2]) / closes[-2] * 100) if len(closes) >= 2 and closes[-2] != 0 else 0,
+            "high_20": max(highs[-20:]) if len(highs) >= 20 else max(highs),
+            "low_20": min(lows[-20:]) if len(lows) >= 20 else min(lows),
+            "avg_volume": np.mean(volumes[-20:]) if len(volumes) >= 20 else np.mean(volumes) if volumes else None,
+            "volume_ratio": volumes[-1] / np.mean(volumes[-20:]) if len(volumes) >= 20 and np.mean(volumes[-20:]) != 0 else None
+        }
+        
+        # Calculate RSI (14-period)
+        if len(closes) >= 15:
+            price_changes = [closes[i] - closes[i-1] for i in range(1, len(closes))]
+            gains = [change if change > 0 else 0 for change in price_changes]
+            losses = [-change if change < 0 else 0 for change in price_changes]
+            
+            avg_gain = np.mean(gains[-14:])
+            avg_loss = np.mean(losses[-14:])
+            
+            if avg_loss != 0:
+                rs = avg_gain / avg_loss
+                indicators["rsi"] = 100 - (100 / (1 + rs))
+            else:
+                indicators["rsi"] = 100 if avg_gain > 0 else 50
+        
+        return indicators
+        
+    except Exception as e:
+        app.logger.error(f"Error calculating indicators: {e}")
+        return {}
+
+# --- Storage and Token Management ---
 
 def store_tokens(access_token, refresh_token):
     global ACCESS_TOKEN, REFRESH_TOKEN
@@ -136,6 +372,281 @@ def refresh_access_token():
 # Initialize Fyers model at startup
 initialize_fyers_model()
 
+# --- Gemini AI Endpoints ---
+
+@app.route('/api/ai/analyze', methods=['POST'])
+def ai_analyze():
+    """
+    Analyze market data using Gemini AI.
+    
+    Request body:
+    {
+        "data": {...},  # Market data to analyze
+        "analysis_type": "general|technical|sentiment|risk"
+    }
+    """
+    if not gemini_model:
+        return jsonify({"error": "AI model not initialized. Please set GEMINI_API_KEY."}), 503
+    
+    request_data = request.json
+    if not request_data or not request_data.get("data"):
+        return jsonify({"error": "Missing 'data' in request body"}), 400
+    
+    analysis_type = request_data.get("analysis_type", "general")
+    data = request_data.get("data")
+    
+    result = analyze_market_data_with_ai(data, analysis_type)
+    return jsonify(result)
+
+@app.route('/api/ai/trading-signals', methods=['POST'])
+def ai_trading_signals():
+    """
+    Generate trading signals using AI.
+    
+    Request body:
+    {
+        "symbol": "NSE:SBIN-EQ",
+        "use_live_data": true  # Optional, will fetch current data if true
+    }
+    """
+    if not gemini_model:
+        return jsonify({"error": "AI model not initialized. Please set GEMINI_API_KEY."}), 503
+    
+    request_data = request.json
+    symbol = request_data.get("symbol")
+    use_live_data = request_data.get("use_live_data", False)
+    
+    if not symbol:
+        return jsonify({"error": "Missing 'symbol' in request body"}), 400
+    
+    try:
+        # Fetch historical data if requested
+        if use_live_data and fyers_instance:
+            # Get current quote
+            quote_result = make_fyers_api_call(fyers_instance.quotes, data={"symbols": symbol})
+            current_price = None
+            if quote_result and isinstance(quote_result, dict):
+                quote_data = quote_result.get("d", [{}])[0]
+                current_price = quote_data.get("v", {}).get("lp", 0)
+            
+            # Get historical data
+            end_time = int(time.time())
+            start_time = end_time - (30 * 24 * 60 * 60)  # 30 days of data
+            
+            history_data = {
+                "symbol": symbol,
+                "resolution": "1D",
+                "date_format": 0,
+                "range_from": str(start_time),
+                "range_to": str(end_time),
+                "cont_flag": 1
+            }
+            
+            history_result = make_fyers_api_call(fyers_instance.history, data=history_data)
+            
+            if history_result and isinstance(history_result, dict):
+                candles = history_result.get("candles", [])
+                if not current_price and candles:
+                    current_price = candles[-1][4]  # Last close price
+                
+                signals = generate_trading_signals_with_ai(symbol, candles, current_price or 0)
+                
+                # Add technical indicators
+                indicators = calculate_advanced_indicators(candles)
+                signals["technical_indicators"] = indicators
+                
+                return jsonify(signals)
+            else:
+                return jsonify({"error": "Failed to fetch historical data"}), 500
+        else:
+            # Use provided data or return error
+            historical_data = request_data.get("historical_data", [])
+            current_price = request_data.get("current_price", 0)
+            
+            if not historical_data:
+                return jsonify({"error": "Either enable 'use_live_data' or provide 'historical_data' and 'current_price'"}), 400
+            
+            signals = generate_trading_signals_with_ai(symbol, historical_data, current_price)
+            return jsonify(signals)
+            
+    except Exception as e:
+        app.logger.error(f"Error generating trading signals: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/ai/chat', methods=['POST'])
+def ai_chat():
+    """
+    Chat with Gemini AI about trading and markets.
+    
+    Request body:
+    {
+        "message": "What's your analysis on NIFTY50?",
+        "context": {...}  # Optional context data
+    }
+    """
+    if not gemini_model:
+        return jsonify({"error": "AI model not initialized. Please set GEMINI_API_KEY."}), 503
+    
+    request_data = request.json
+    message = request_data.get("message")
+    context = request_data.get("context", {})
+    
+    if not message:
+        return jsonify({"error": "Missing 'message' in request body"}), 400
+    
+    try:
+        # Prepare the prompt with trading context
+        prompt = f"""
+        You are an expert trading advisor and market analyst. 
+        Please provide helpful, accurate, and actionable insights.
+        
+        User Question: {message}
+        """
+        
+        if context:
+            prompt += f"\n\nAdditional Context:\n{json.dumps(context, indent=2)}"
+        
+        prompt += "\n\nProvide a clear, structured response with specific insights and recommendations where applicable."
+        
+        response = gemini_model.generate_content(prompt)
+        
+        return jsonify({
+            "question": message,
+            "response": response.text,
+            "timestamp": datetime.datetime.now().isoformat()
+        })
+        
+    except Exception as e:
+        app.logger.error(f"AI chat error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/ai/portfolio-analysis', methods=['POST'])
+def ai_portfolio_analysis():
+    """
+    Analyze portfolio using AI and provide recommendations.
+    
+    Request body:
+    {
+        "holdings": [...],  # Portfolio holdings
+        "risk_profile": "conservative|moderate|aggressive"
+    }
+    """
+    if not gemini_model:
+        return jsonify({"error": "AI model not initialized. Please set GEMINI_API_KEY."}), 503
+    
+    request_data = request.json
+    holdings = request_data.get("holdings", [])
+    risk_profile = request_data.get("risk_profile", "moderate")
+    
+    if not holdings:
+        # Try to fetch from Fyers if authenticated
+        if fyers_instance:
+            holdings_result = make_fyers_api_call(fyers_instance.holdings)
+            if holdings_result and isinstance(holdings_result, dict):
+                holdings = holdings_result.get("holdings", [])
+    
+    if not holdings:
+        return jsonify({"error": "No holdings data available"}), 400
+    
+    try:
+        prompt = f"""
+        Analyze the following portfolio and provide comprehensive recommendations:
+        
+        Portfolio Holdings:
+        {json.dumps(holdings, indent=2)}
+        
+        Risk Profile: {risk_profile}
+        
+        Please provide:
+        1. Portfolio composition analysis
+        2. Risk assessment
+        3. Diversification analysis
+        4. Sector allocation review
+        5. Rebalancing recommendations
+        6. Specific buy/sell/hold recommendations for each holding
+        7. New investment opportunities based on the risk profile
+        8. Expected returns and risk metrics
+        
+        Format the response in a clear, actionable manner.
+        """
+        
+        response = gemini_model.generate_content(prompt)
+        
+        return jsonify({
+            "portfolio_analysis": response.text,
+            "risk_profile": risk_profile,
+            "holdings_count": len(holdings),
+            "timestamp": datetime.datetime.now().isoformat()
+        })
+        
+    except Exception as e:
+        app.logger.error(f"Portfolio analysis error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/ai/market-summary', methods=['GET'])
+def ai_market_summary():
+    """
+    Get AI-generated market summary and outlook.
+    """
+    if not gemini_model:
+        return jsonify({"error": "AI model not initialized. Please set GEMINI_API_KEY."}), 503
+    
+    try:
+        # You can enhance this by fetching real market data
+        prompt = f"""
+        Provide a comprehensive market summary for Indian markets as of {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}:
+        
+        Include:
+        1. Overall market sentiment and trend
+        2. Key indices performance outlook (NIFTY, SENSEX, BANKNIFTY)
+        3. Sector rotation analysis
+        4. Global market impact on Indian markets
+        5. Key events and their potential impact
+        6. FII/DII activity insights
+        7. Currency and commodity outlook
+        8. Top opportunities for the day/week
+        9. Key risks to watch
+        10. Recommended trading strategies for current market conditions
+        
+        Be specific with levels, percentages, and actionable insights.
+        """
+        
+        response = gemini_model.generate_content(prompt)
+        
+        return jsonify({
+            "market_summary": response.text,
+            "generated_at": datetime.datetime.now().isoformat()
+        })
+        
+    except Exception as e:
+        app.logger.error(f"Market summary error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+# --- Helper function to wrap Fyers API calls with refresh logic ---
+def make_fyers_api_call(api_method, *args, **kwargs):
+    global fyers_instance
+    if not fyers_instance:
+        app.logger.warning("Fyers API not initialized. Attempting to initialize.")
+        if not initialize_fyers_model():
+            return jsonify({"error": "Fyers API not initialized. Please authenticate first."}), 401
+
+    try:
+        return api_method(*args, **kwargs)
+    except Exception as e:
+        error_message = str(e).lower()
+
+        if "token" in error_message or "authenticated" in error_message or "login" in error_message or "invalid_access_token" in error_message:
+            app.logger.warning(f"Access token expired or invalid. Attempting to refresh. Original error: {e}")
+            if refresh_access_token():
+                app.logger.info("Token refreshed, retrying original request.")
+                return api_method(*args, **kwargs)
+            else:
+                app.logger.error("Token refresh failed. Cannot fulfill request.")
+                return jsonify({"error": "Fyers API token expired and refresh failed. Please re-authenticate."}), 401
+        else:
+            app.logger.error(f"Non-token related Fyers API error: {e}", exc_info=True)
+            return jsonify({"error": f"Fyers API error: {str(e)}"}), 500
+
 # --- Fyers Authentication Flow Endpoints ---
 
 @app.route('/fyers-login')
@@ -200,31 +711,6 @@ def fyers_auth_callback():
         app.logger.error(f"Error generating Fyers access token: {e}", exc_info=True)
         return jsonify({"error": f"Failed to generate Fyers access token: {str(e)}"}), 500
 
-# --- Helper function to wrap Fyers API calls with refresh logic ---
-def make_fyers_api_call(api_method, *args, **kwargs):
-    global fyers_instance
-    if not fyers_instance:
-        app.logger.warning("Fyers API not initialized. Attempting to initialize.")
-        if not initialize_fyers_model():
-            return jsonify({"error": "Fyers API not initialized. Please authenticate first."}), 401
-
-    try:
-        return api_method(*args, **kwargs)
-    except Exception as e:
-        error_message = str(e).lower()
-
-        if "token" in error_message or "authenticated" in error_message or "login" in error_message or "invalid_access_token" in error_message:
-            app.logger.warning(f"Access token expired or invalid. Attempting to refresh. Original error: {e}")
-            if refresh_access_token():
-                app.logger.info("Token refreshed, retrying original request.")
-                return api_method(*args, **kwargs)
-            else:
-                app.logger.error("Token refresh failed. Cannot fulfill request.")
-                return jsonify({"error": "Fyers API token expired and refresh failed. Please re-authenticate."}), 401
-        else:
-            app.logger.error(f"Non-token related Fyers API error: {e}", exc_info=True)
-            return jsonify({"error": f"Fyers API error: {str(e)}"}), 500
-
 # --- Fyers Data Endpoints ---
 
 @app.route('/api/fyers/profile')
@@ -252,22 +738,7 @@ def get_holdings():
 def get_history():
     """
     Fetch historical data with support for second-level, minute-level, and day-level resolutions.
-    
-    Example request body for second-level data:
-    {
-        "symbol": "NSE:SBIN-EQ",
-        "resolution": "1S",  # 1 second candles
-        "date_format": 0,     # 0 for epoch, 1 for string
-        "range_from": "1704067200",  # Start epoch timestamp
-        "range_to": "1704070800",    # End epoch timestamp
-        "cont_flag": 1,
-        "oi_flag": 0
-    }
-    
-    Supported resolutions:
-    - Second: "1S", "5S", "10S", "15S", "30S", "45S"
-    - Minute: "1", "2", "3", "5", "10", "15", "20", "30", "60", "120", "240"
-    - Day: "1D", "D"
+    Enhanced with optional AI analysis.
     """
     data = request.json
 
@@ -275,6 +746,10 @@ def get_history():
     if not data or not all(k in data for k in required_params):
         app.logger.warning(f"Missing required parameters for history API. Received: {data}")
         return jsonify({"error": f"Missing required parameters for history API. Need {', '.join(required_params)}."}), 400
+
+    # Check if AI analysis is requested
+    include_ai_analysis = data.get("include_ai_analysis", False)
+    ai_analysis_type = data.get("ai_analysis_type", "technical")
 
     # Validate resolution
     resolution = data["resolution"]
@@ -320,10 +795,8 @@ def get_history():
             return jsonify({"error": "Unsupported resolution format."}), 400
 
         if resolution_in_seconds > 0:
-            # Calculate the start epoch of the current incomplete candle
             current_resolution_start_epoch = (current_time // resolution_in_seconds) * resolution_in_seconds
 
-            # Adjust range_to to exclude incomplete candles
             if requested_range_to >= current_resolution_start_epoch:
                 adjusted_range_to_epoch = current_resolution_start_epoch - 1
 
@@ -334,13 +807,11 @@ def get_history():
                 data["range_to"] = str(adjusted_range_to_epoch)
                 app.logger.info(f"Adjusted 'range_to' for resolution '{resolution}' to ensure completed candles: {requested_range_to} -> {data['range_to']}")
 
-    # Convert optional flags to integers
     if "cont_flag" in data:
         data["cont_flag"] = int(data["cont_flag"])
     if "oi_flag" in data:
         data["oi_flag"] = int(data["oi_flag"])
 
-    # Log the request for debugging
     app.logger.info(f"Fetching history data: Symbol={data['symbol']}, Resolution={data['resolution']}, From={data['range_from']}, To={data['range_to']}")
 
     result = make_fyers_api_call(fyers_instance.history, data=data)
@@ -351,12 +822,35 @@ def get_history():
     if result and result.get("s") == "ok":
         candles_count = len(result.get("candles", []))
         app.logger.info(f"Successfully fetched {candles_count} candles for {data['symbol']} at {data['resolution']} resolution")
+        
+        # Add AI analysis if requested
+        if include_ai_analysis and gemini_model and candles_count > 0:
+            try:
+                candles = result.get("candles", [])
+                indicators = calculate_advanced_indicators(candles)
+                
+                analysis_data = {
+                    "symbol": data["symbol"],
+                    "resolution": data["resolution"],
+                    "candles_count": candles_count,
+                    "indicators": indicators,
+                    "latest_candle": candles[-1] if candles else None
+                }
+                
+                ai_analysis = analyze_market_data_with_ai(analysis_data, ai_analysis_type)
+                result["ai_analysis"] = ai_analysis
+                
+            except Exception as e:
+                app.logger.error(f"Failed to add AI analysis: {e}")
+                result["ai_analysis"] = {"error": str(e)}
     
     return jsonify(result)
 
 @app.route('/api/fyers/quotes', methods=['GET'])
 def get_quotes():
     symbols = request.args.get('symbols')
+    include_ai_analysis = request.args.get('include_ai_analysis', 'false').lower() == 'true'
+    
     if not symbols:
         app.logger.warning("Missing 'symbols' parameter for quotes API.")
         return jsonify({"error": "Missing 'symbols' parameter. Eg: /api/fyers/quotes?symbols=NSE:SBIN-EQ,NSE:TCS-EQ"}), 400
@@ -365,6 +859,17 @@ def get_quotes():
     result = make_fyers_api_call(fyers_instance.quotes, data=data)
     if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], int):
         return result
+    
+    # Add AI analysis if requested
+    if include_ai_analysis and gemini_model and result and result.get("d"):
+        try:
+            quotes_data = result.get("d", [])
+            ai_analysis = analyze_market_data_with_ai({"quotes": quotes_data}, "general")
+            result["ai_analysis"] = ai_analysis
+        except Exception as e:
+            app.logger.error(f"Failed to add AI analysis to quotes: {e}")
+            result["ai_analysis"] = {"error": str(e)}
+    
     return jsonify(result)
 
 @app.route('/api/fyers/market_depth', methods=['GET'])
@@ -1092,15 +1597,23 @@ def ws_fyers(ws):
 @app.route('/')
 def home():
     return jsonify({
-        "message": "Fyers API Proxy Server is running!",
+        "message": "Fyers API Proxy Server with AI Integration is running!",
         "endpoints": {
             "authentication": "/fyers-login",
             "historical_data": "/api/fyers/history",
+            "ai_endpoints": {
+                "analyze": "/api/ai/analyze",
+                "trading_signals": "/api/ai/trading-signals",
+                "chat": "/api/ai/chat",
+                "portfolio_analysis": "/api/ai/portfolio-analysis",
+                "market_summary": "/api/ai/market-summary"
+            },
             "supported_resolutions": {
                 "second": SECOND_RESOLUTIONS,
                 "minute": MINUTE_RESOLUTIONS,
                 "day": DAY_RESOLUTIONS
-            }
+            },
+            "ai_status": "enabled" if gemini_model else "disabled (set GEMINI_API_KEY)"
         }
     })
 
