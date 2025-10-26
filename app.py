@@ -1,1390 +1,1631 @@
-"""
-Production-ready Fyers API Proxy Server with AI Integration
-Includes support for Stocks, Commodities, and Mutual Funds
-"""
-
 import os
-import json
-import time
-import datetime
-import logging
-import threading
-import asyncio
-from typing import List, Dict, Any, Optional, Union
-from functools import wraps
-from dataclasses import dataclass
-import hashlib
-
-import numpy as np
-import redis
-from dotenv import load_dotenv
-from flask import Flask, request, jsonify, redirect, url_for, current_app
-from flask_cors import CORS
-from flask_limiter import Limiter
-from flask_limiter.util import get_remote_address
-from flask_caching import Cache
-from flask_sock import Sock
-from marshmallow import Schema, fields, validate, ValidationError
-import google.generativeai as genai
-from google.generativeai.types import HarmCategory, HarmBlockThreshold
-
+from flask import Flask, request, jsonify, redirect, url_for
 from fyers_apiv3 import fyersModel
 from fyers_apiv3.FyersWebsocket import data_ws
-from werkzeug.security import generate_password_hash, check_password_hash
-from cryptography.fernet import Fernet
+from dotenv import load_dotenv
+from flask_cors import CORS
+import datetime
+import time
+import logging
+import json
+import threading
+from backtesting.routes import backtesting_bp
+from flask_sock import Sock
+from typing import List, Dict, Any
+import math
+import google.generativeai as genai
+from google.generativeai.types import HarmCategory, HarmBlockThreshold
+import asyncio
+import numpy as np
 
-# Load environment variables
+# Load environment variables from .env file (for local development)
 load_dotenv()
 
-# ========================= Configuration =========================
+app = Flask(__name__)
+CORS(app)  # Enable CORS for all routes
 
-@dataclass
-class Config:
-    """Application configuration"""
-    # Flask
-    SECRET_KEY: str = os.environ.get("SECRET_KEY", os.urandom(32).hex())
-    DEBUG: bool = False
-    TESTING: bool = False
-    
-    # CORS
-    CORS_ORIGINS: list = ["http://localhost:3000", "https://yourdomain.com"]
-    
-    # Rate Limiting
-    RATELIMIT_STORAGE_URL: str = os.environ.get("REDIS_URL", "redis://localhost:6379")
-    
-    # Caching
-    CACHE_TYPE: str = "redis"
-    CACHE_REDIS_URL: str = os.environ.get("REDIS_URL", "redis://localhost:6379")
-    CACHE_DEFAULT_TIMEOUT: int = 300
-    
-    # Fyers API
-    FYERS_CLIENT_ID: str = os.environ.get("FYERS_CLIENT_ID", "")
-    FYERS_SECRET_KEY: str = os.environ.get("FYERS_SECRET_KEY", "")
-    FYERS_REDIRECT_URI: str = os.environ.get("FYERS_REDIRECT_URI", "")
-    FYERS_ACCESS_TOKEN: str = os.environ.get("FYERS_ACCESS_TOKEN", "")
-    FYERS_REFRESH_TOKEN: str = os.environ.get("FYERS_REFRESH_TOKEN", "")
-    
-    # Gemini AI
-    GEMINI_API_KEY: str = os.environ.get("GEMINI_API_KEY", "")
-    GEMINI_MODEL: str = os.environ.get("GEMINI_MODEL", "gemini-1.5-flash")
-    
-    # Security
-    ENCRYPTION_KEY: str = os.environ.get("ENCRYPTION_KEY", Fernet.generate_key().decode())
-    MAX_CONTENT_LENGTH: int = 16 * 1024 * 1024  # 16MB max request size
-    
-    # WebSocket
-    MAX_WS_CONNECTIONS: int = 100
-    WS_HEARTBEAT_INTERVAL: int = 30
-
-class ProductionConfig(Config):
-    """Production configuration"""
-    DEBUG = False
-    TESTING = False
-
-class DevelopmentConfig(Config):
-    """Development configuration"""
-    DEBUG = True
-    TESTING = False
-    CORS_ORIGINS = ["*"]  # Allow all origins in development
-
-# ========================= App Initialization =========================
-
-def create_app(config_name='production'):
-    """Application factory pattern"""
-    app = Flask(__name__)
-    
-    # Load configuration
-    if config_name == 'production':
-        app.config.from_object(ProductionConfig())
-    else:
-        app.config.from_object(DevelopmentConfig())
-    
-    # Security headers
-    @app.after_request
-    def set_security_headers(response):
-        response.headers['X-Content-Type-Options'] = 'nosniff'
-        response.headers['X-Frame-Options'] = 'DENY'
-        response.headers['X-XSS-Protection'] = '1; mode=block'
-        response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
-        return response
-    
-    return app
-
-# Create app instance
-app = create_app(os.environ.get('FLASK_ENV', 'production'))
-
-# Initialize extensions
-CORS(app, origins=app.config['CORS_ORIGINS'])
-limiter = Limiter(
-    app=app,
-    key_func=get_remote_address,
-    default_limits=["1000 per hour"],
-    storage_uri=app.config['RATELIMIT_STORAGE_URL']
-)
-cache = Cache(app)
+# Initialize Sock for client-facing websocket connections
 sock = Sock(app)
 
 # Configure logging
-logging.basicConfig(
-    level=logging.INFO if not app.debug else logging.DEBUG,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('app.log'),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+app.logger.setLevel(logging.INFO)
 
-# ========================= Security Utilities =========================
+# --- Fyers API Configuration (from environment variables) ---
+CLIENT_ID = os.environ.get("FYERS_CLIENT_ID")
+SECRET_KEY = os.environ.get("FYERS_SECRET_KEY")
+REDIRECT_URI = os.environ.get("FYERS_REDIRECT_URI")
+ACCESS_TOKEN = os.environ.get("FYERS_ACCESS_TOKEN")
+REFRESH_TOKEN = os.environ.get("FYERS_REFRESH_TOKEN")
 
-class TokenManager:
-    """Secure token management"""
-    
-    def __init__(self, encryption_key: str):
-        self.cipher = Fernet(encryption_key.encode() if isinstance(encryption_key, str) else encryption_key)
-        self._tokens = {}
-        self._lock = threading.Lock()
-    
-    def store_token(self, key: str, token: str) -> None:
-        """Store encrypted token"""
-        with self._lock:
-            encrypted = self.cipher.encrypt(token.encode())
-            self._tokens[key] = encrypted
-            # Also store in Redis for persistence
-            try:
-                redis_client = redis.from_url(app.config['CACHE_REDIS_URL'])
-                redis_client.setex(f"token:{key}", 3600, encrypted)
-            except Exception as e:
-                logger.error(f"Failed to store token in Redis: {e}")
-    
-    def get_token(self, key: str) -> Optional[str]:
-        """Retrieve and decrypt token"""
-        with self._lock:
-            # Try memory first
-            encrypted = self._tokens.get(key)
-            if not encrypted:
-                # Try Redis
-                try:
-                    redis_client = redis.from_url(app.config['CACHE_REDIS_URL'])
-                    encrypted = redis_client.get(f"token:{key}")
-                except Exception as e:
-                    logger.error(f"Failed to retrieve token from Redis: {e}")
-                    return None
-            
-            if encrypted:
-                try:
-                    return self.cipher.decrypt(encrypted).decode()
-                except Exception as e:
-                    logger.error(f"Failed to decrypt token: {e}")
-            return None
+# --- Gemini AI Configuration ---
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")  # Default to flash model
 
-# Initialize token manager
-token_manager = TokenManager(app.config['ENCRYPTION_KEY'])
+# Add a base URL for your proxy for internal calls
+app.config["FYERS_PROXY_BASE_URL"] = os.environ.get("FYERS_PROXY_BASE_URL", "http://localhost:5000")
 
-# ========================= Input Validation Schemas =========================
+# Supported second-level resolutions
+SECOND_RESOLUTIONS = ["1S", "5S", "10S", "15S", "30S", "45S"]
+MINUTE_RESOLUTIONS = ["1", "2", "3", "5", "10", "15", "20", "30", "60", "120", "240"]
+DAY_RESOLUTIONS = ["1D", "D"]
 
-class SymbolSchema(Schema):
-    """Validation for symbol parameter"""
-    symbol = fields.Str(required=True, validate=validate.Length(min=1, max=50))
-
-class HistoryRequestSchema(Schema):
-    """Validation for history request"""
-    symbol = fields.Str(required=True, validate=validate.Length(min=1, max=50))
-    resolution = fields.Str(required=True)
-    date_format = fields.Int(required=True, validate=validate.OneOf([0, 1]))
-    range_from = fields.Str(required=True)
-    range_to = fields.Str(required=True)
-    cont_flag = fields.Int(missing=1, validate=validate.OneOf([0, 1]))
-    oi_flag = fields.Int(missing=0, validate=validate.OneOf([0, 1]))
-    include_ai_analysis = fields.Bool(missing=False)
-    ai_analysis_type = fields.Str(missing="technical", validate=validate.OneOf(["general", "technical", "sentiment", "risk"]))
-
-class OrderSchema(Schema):
-    """Validation for order placement"""
-    symbol = fields.Str(required=True)
-    qty = fields.Int(required=True, validate=validate.Range(min=1))
-    type = fields.Int(required=True, validate=validate.OneOf([1, 2, 3, 4]))
-    side = fields.Int(required=True, validate=validate.OneOf([1, -1]))
-    productType = fields.Str(required=True, validate=validate.OneOf(["CNC", "INTRADAY", "MARGIN", "CO", "BO"]))
-    limitPrice = fields.Float(missing=0)
-    stopPrice = fields.Float(missing=0)
-    validity = fields.Str(missing="DAY", validate=validate.OneOf(["DAY", "IOC"]))
-    disclosedQty = fields.Int(missing=0)
-    offlineOrder = fields.Bool(missing=False)
-
-class CommoditySchema(Schema):
-    """Validation for commodity operations"""
-    symbol = fields.Str(required=True, validate=validate.Regexp(r'^MCX:.*'))
-    qty = fields.Int(required=True, validate=validate.Range(min=1))
-    type = fields.Str(required=True, validate=validate.OneOf(["FUTURES", "OPTIONS"]))
-
-class MutualFundSchema(Schema):
-    """Validation for mutual fund operations"""
-    symbol = fields.Str(required=True)
-    amount = fields.Float(required=True, validate=validate.Range(min=1))
-    type = fields.Str(required=True, validate=validate.OneOf(["LUMPSUM", "SIP"]))
-    folio_number = fields.Str(missing=None)
-
-# ========================= Decorators =========================
-
-def validate_input(schema_class):
-    """Decorator for input validation"""
-    def decorator(f):
-        @wraps(f)
-        def decorated_function(*args, **kwargs):
-            schema = schema_class()
-            try:
-                if request.method == 'GET':
-                    data = schema.load(request.args)
-                else:
-                    data = schema.load(request.json or {})
-                request.validated_data = data
-            except ValidationError as err:
-                return jsonify({"error": "Validation error", "details": err.messages}), 400
-            return f(*args, **kwargs)
-        return decorated_function
-    return decorator
-
-def require_auth(f):
-    """Decorator to require authentication"""
-    @wraps(f)
-    def decorated_function(*args, **kwargs):
-        # Check for API key in header
-        api_key = request.headers.get('X-API-Key')
-        if not api_key:
-            return jsonify({"error": "Authentication required"}), 401
+# Initialize Gemini AI
+gemini_model = None
+if GEMINI_API_KEY:
+    try:
+        genai.configure(api_key=GEMINI_API_KEY)
         
-        # Validate API key (implement your logic)
-        # For now, we'll check if Fyers is initialized
-        if not fyers_manager.is_initialized():
-            return jsonify({"error": "Fyers API not initialized"}), 503
+        # Configure the model with specific settings
+        generation_config = {
+            "temperature": 0.7,
+            "top_p": 0.95,
+            "top_k": 40,
+            "max_output_tokens": 8192,
+        }
         
-        return f(*args, **kwargs)
-    return decorated_function
-
-# ========================= Fyers API Manager =========================
-
-class FyersAPIManager:
-    """Centralized Fyers API management with error handling and retry logic"""
-    
-    def __init__(self):
-        self.fyers_instance = None
-        self.is_authenticated = False
-        self._lock = threading.Lock()
-        self.retry_count = 3
-        self.retry_delay = 1
-    
-    def initialize(self, access_token: Optional[str] = None) -> bool:
-        """Initialize Fyers model with token"""
-        with self._lock:
-            token = access_token or token_manager.get_token("fyers_access")
-            
-            if not token:
-                logger.warning("No access token available for Fyers initialization")
-                return False
-            
-            try:
-                self.fyers_instance = fyersModel.FyersModel(
-                    token=token,
-                    is_async=False,
-                    client_id=app.config['FYERS_CLIENT_ID'],
-                    log_path=""
-                )
-                self.is_authenticated = True
-                logger.info("Fyers API initialized successfully")
-                return True
-            except Exception as e:
-                logger.error(f"Failed to initialize Fyers API: {e}")
-                self.is_authenticated = False
-                return False
-    
-    def is_initialized(self) -> bool:
-        """Check if Fyers is initialized"""
-        return self.fyers_instance is not None and self.is_authenticated
-    
-    def make_api_call(self, method, *args, **kwargs):
-        """Make API call with retry logic and error handling"""
-        if not self.is_initialized():
-            if not self.initialize():
-                raise Exception("Fyers API not initialized")
+        safety_settings = {
+            HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
+            HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
+            HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
+            HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
+        }
         
-        last_error = None
-        for attempt in range(self.retry_count):
-            try:
-                result = method(*args, **kwargs)
-                return result
-            except Exception as e:
-                last_error = e
-                error_msg = str(e).lower()
-                
-                # Handle token expiration
-                if any(word in error_msg for word in ['token', 'auth', 'expired', 'invalid']):
-                    logger.warning(f"Token error detected: {e}")
-                    if self.refresh_token():
-                        continue
-                    else:
-                        raise Exception("Authentication failed and refresh token failed")
-                
-                # Handle rate limiting
-                if 'rate' in error_msg or '429' in str(e):
-                    wait_time = (attempt + 1) * 2
-                    logger.warning(f"Rate limit hit, waiting {wait_time} seconds")
-                    time.sleep(wait_time)
-                    continue
-                
-                # Other errors
-                if attempt < self.retry_count - 1:
-                    time.sleep(self.retry_delay * (attempt + 1))
-                    continue
-                
-        raise last_error or Exception("API call failed after retries")
-    
-    def refresh_token(self) -> bool:
-        """Refresh access token"""
-        refresh_token = token_manager.get_token("fyers_refresh")
-        if not refresh_token:
-            logger.error("No refresh token available")
-            return False
+        gemini_model = genai.GenerativeModel(
+            model_name=GEMINI_MODEL,
+            generation_config=generation_config,
+            safety_settings=safety_settings
+        )
         
-        try:
-            session = fyersModel.SessionModel(
-                client_id=app.config['FYERS_CLIENT_ID'],
-                redirect_uri=app.config['FYERS_REDIRECT_URI'],
-                response_type="code",
-                state="refresh_state",
-                secret_key=app.config['FYERS_SECRET_KEY'],
-                grant_type="refresh_token"
-            )
-            session.set_token(refresh_token)
-            response = session.generate_token()
-            
-            if response and response.get("s") == "ok":
-                new_access = response["access_token"]
-                new_refresh = response.get("refresh_token", refresh_token)
+        app.logger.info(f"Gemini AI initialized with model: {GEMINI_MODEL}")
+    except Exception as e:
+        app.logger.error(f"Failed to initialize Gemini AI: {e}")
+        gemini_model = None
+else:
+    app.logger.warning("GEMINI_API_KEY not found. AI features will be disabled.")
+
+if not all([CLIENT_ID, SECRET_KEY, REDIRECT_URI]):
+    app.logger.error("ERROR: Fyers API credentials (CLIENT_ID, SECRET_KEY, REDIRECT_URI) are not fully set.")
+
+# Initialize FyersModel
+fyers_instance = None 
+
+# --- AI Analysis Functions ---
+
+def analyze_market_data_with_ai(data: Dict[str, Any], analysis_type: str = "general") -> Dict[str, Any]:
+    """
+    Use Gemini AI to analyze market data and provide insights.
+    
+    Args:
+        data: Market data to analyze
+        analysis_type: Type of analysis (general, technical, sentiment, risk)
+    
+    Returns:
+        AI analysis response
+    """
+    if not gemini_model:
+        return {"error": "AI model not initialized"}
+    
+    try:
+        prompts = {
+            "general": f"""
+                Analyze the following market data and provide insights:
+                {json.dumps(data, indent=2)}
                 
-                token_manager.store_token("fyers_access", new_access)
-                token_manager.store_token("fyers_refresh", new_refresh)
+                Please provide:
+                1. Key observations
+                2. Trend analysis
+                3. Risk factors
+                4. Potential opportunities
+                5. Recommended actions
                 
-                return self.initialize(new_access)
-            
-            logger.error(f"Token refresh failed: {response}")
-            return False
-            
-        except Exception as e:
-            logger.error(f"Error during token refresh: {e}")
-            return False
-
-# Initialize Fyers manager
-fyers_manager = FyersAPIManager()
-
-# ========================= AI Manager =========================
-
-class AIAnalysisManager:
-    """Centralized AI analysis management"""
-    
-    def __init__(self):
-        self.model = None
-        self.initialize()
-    
-    def initialize(self):
-        """Initialize Gemini AI model"""
-        if not app.config['GEMINI_API_KEY']:
-            logger.warning("Gemini API key not configured")
-            return
+                Format the response in a clear, structured manner.
+            """,
+            "technical": f"""
+                Perform technical analysis on the following market data:
+                {json.dumps(data, indent=2)}
+                
+                Include:
+                1. Support and resistance levels
+                2. Trend direction and strength
+                3. Volume analysis
+                4. Key technical indicators interpretation
+                5. Entry and exit points
+                
+                Be specific with price levels and percentages.
+            """,
+            "sentiment": f"""
+                Analyze market sentiment based on the following data:
+                {json.dumps(data, indent=2)}
+                
+                Provide:
+                1. Overall market sentiment (bullish/bearish/neutral)
+                2. Sentiment strength (1-10 scale)
+                3. Key sentiment drivers
+                4. Potential sentiment shifts
+                5. Contrarian opportunities
+            """,
+            "risk": f"""
+                Perform risk analysis on the following market data:
+                {json.dumps(data, indent=2)}
+                
+                Include:
+                1. Risk level assessment (low/medium/high)
+                2. Specific risk factors
+                3. Volatility analysis
+                4. Risk mitigation strategies
+                5. Position sizing recommendations
+                
+                Provide specific percentages and thresholds.
+            """
+        }
         
-        try:
-            genai.configure(api_key=app.config['GEMINI_API_KEY'])
-            
-            generation_config = {
-                "temperature": 0.7,
-                "top_p": 0.95,
-                "top_k": 40,
-                "max_output_tokens": 8192,
-            }
-            
-            safety_settings = {
-                HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
-                HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
-                HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
-                HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
-            }
-            
-            self.model = genai.GenerativeModel(
-                model_name=app.config['GEMINI_MODEL'],
-                generation_config=generation_config,
-                safety_settings=safety_settings
-            )
-            
-            logger.info(f"Gemini AI initialized with model: {app.config['GEMINI_MODEL']}")
-            
-        except Exception as e:
-            logger.error(f"Failed to initialize Gemini AI: {e}")
-            self.model = None
-    
-    def is_available(self) -> bool:
-        """Check if AI model is available"""
-        return self.model is not None
-    
-    @cache.memoize(timeout=300)
-    def analyze(self, data: Dict[str, Any], analysis_type: str = "general") -> Dict[str, Any]:
-        """Perform AI analysis with caching"""
-        if not self.is_available():
-            return {"error": "AI model not available"}
+        prompt = prompts.get(analysis_type, prompts["general"])
+        response = gemini_model.generate_content(prompt)
         
-        try:
-            # Sanitize data to prevent prompt injection
-            sanitized_data = self._sanitize_data(data)
-            
-            prompts = {
-                "general": self._get_general_prompt(sanitized_data),
-                "technical": self._get_technical_prompt(sanitized_data),
-                "sentiment": self._get_sentiment_prompt(sanitized_data),
-                "risk": self._get_risk_prompt(sanitized_data),
-                "commodity": self._get_commodity_prompt(sanitized_data),
-                "mutual_fund": self._get_mutual_fund_prompt(sanitized_data)
-            }
-            
-            prompt = prompts.get(analysis_type, prompts["general"])
-            response = self.model.generate_content(prompt)
-            
-            return {
-                "analysis_type": analysis_type,
-                "analysis": response.text,
-                "timestamp": datetime.datetime.now().isoformat(),
-                "cached": False
-            }
-            
-        except Exception as e:
-            logger.error(f"AI analysis error: {e}")
-            return {"error": str(e)}
+        return {
+            "analysis_type": analysis_type,
+            "analysis": response.text,
+            "timestamp": datetime.datetime.now().isoformat()
+        }
+        
+    except Exception as e:
+        app.logger.error(f"AI analysis error: {e}")
+        return {"error": str(e)}
+
+def generate_trading_signals_with_ai(symbol: str, historical_data: List, current_price: float) -> Dict[str, Any]:
+    """
+    Generate trading signals using AI based on historical data and current price.
+    """
+    if not gemini_model:
+        return {"error": "AI model not initialized"}
     
-    def _sanitize_data(self, data: Any) -> Any:
-        """Sanitize data to prevent prompt injection"""
-        if isinstance(data, dict):
-            return {k: self._sanitize_data(v) for k, v in data.items()}
-        elif isinstance(data, list):
-            return [self._sanitize_data(item) for item in data]
-        elif isinstance(data, str):
-            # Remove potential injection patterns
-            sanitized = data.replace("```", "").replace("system:", "").replace("assistant:", "")
-            return sanitized[:1000]  # Limit string length
-        else:
-            return data
-    
-    def _get_general_prompt(self, data):
-        return f"""
-        Analyze the following market data and provide insights:
-        {json.dumps(data, indent=2)}
+    try:
+        # Prepare data for AI analysis
+        recent_candles = historical_data[-20:] if len(historical_data) > 20 else historical_data
+        
+        prompt = f"""
+        As a trading analyst, generate trading signals for {symbol} based on the following data:
+        
+        Current Price: {current_price}
+        Recent Historical Data (last {len(recent_candles)} candles):
+        {json.dumps(recent_candles, indent=2)}
         
         Provide:
-        1. Key observations
-        2. Trend analysis
-        3. Risk factors
-        4. Opportunities
-        5. Recommendations
+        1. Signal: BUY/SELL/HOLD
+        2. Confidence Level: (0-100%)
+        3. Entry Price
+        4. Stop Loss
+        5. Target Price(s) - provide 3 targets
+        6. Risk-Reward Ratio
+        7. Time Horizon
+        8. Key Reasoning
         
-        Format as structured JSON response.
+        Format as JSON for easy parsing.
         """
-    
-    def _get_technical_prompt(self, data):
-        return f"""
-        Perform technical analysis on:
-        {json.dumps(data, indent=2)}
         
-        Include:
-        1. Support/resistance levels
-        2. Trend direction
-        3. Volume analysis
-        4. Technical indicators
-        5. Entry/exit points
+        response = gemini_model.generate_content(prompt)
         
-        Provide specific price levels and percentages.
-        """
-    
-    def _get_sentiment_prompt(self, data):
-        return f"""
-        Analyze market sentiment for:
-        {json.dumps(data, indent=2)}
+        # Try to parse the response as JSON
+        try:
+            # Extract JSON from the response text
+            response_text = response.text
+            # Find JSON content between ```json and ```
+            import re
+            json_match = re.search(r'```json\s*(.*?)\s*```', response_text, re.DOTALL)
+            if json_match:
+                signal_data = json.loads(json_match.group(1))
+            else:
+                # Try to parse the entire response as JSON
+                signal_data = json.loads(response_text)
+        except:
+            # If JSON parsing fails, return the raw text
+            signal_data = {"raw_analysis": response.text}
         
-        Provide:
-        1. Overall sentiment (bullish/bearish/neutral)
-        2. Sentiment strength (1-10)
-        3. Key drivers
-        4. Potential shifts
-        5. Contrarian opportunities
-        """
-    
-    def _get_risk_prompt(self, data):
-        return f"""
-        Perform risk analysis on:
-        {json.dumps(data, indent=2)}
+        return {
+            "symbol": symbol,
+            "current_price": current_price,
+            "signals": signal_data,
+            "timestamp": datetime.datetime.now().isoformat()
+        }
         
-        Include:
-        1. Risk level (low/medium/high)
-        2. Specific risks
-        3. Volatility analysis
-        4. Mitigation strategies
-        5. Position sizing recommendations
-        """
-    
-    def _get_commodity_prompt(self, data):
-        return f"""
-        Analyze commodity market data:
-        {json.dumps(data, indent=2)}
-        
-        Focus on:
-        1. Supply/demand dynamics
-        2. Seasonal patterns
-        3. Global factors impact
-        4. Price forecasts
-        5. Trading recommendations
-        
-        Consider commodity-specific factors like weather, geopolitics, and storage.
-        """
-    
-    def _get_mutual_fund_prompt(self, data):
-        return f"""
-        Analyze mutual fund data:
-        {json.dumps(data, indent=2)}
-        
-        Provide:
-        1. Performance analysis
-        2. Risk-adjusted returns
-        3. Expense ratio impact
-        4. Peer comparison
-        5. Investment suitability
-        
-        Consider long-term wealth creation and systematic investment benefits.
-        """
+    except Exception as e:
+        app.logger.error(f"AI signal generation error: {e}")
+        return {"error": str(e)}
 
-# Initialize AI manager
-ai_manager = AIAnalysisManager()
-
-# ========================= WebSocket Manager =========================
-
-class WebSocketManager:
-    """Centralized WebSocket management"""
-    
-    def __init__(self):
-        self.clients = set()
-        self.subscriptions = {}
-        self.data_socket = None
-        self._lock = threading.Lock()
-        self.max_connections = app.config['MAX_WS_CONNECTIONS']
-        self.heartbeat_interval = app.config['WS_HEARTBEAT_INTERVAL']
-        self._running = False
-    
-    def add_client(self, client_ws):
-        """Add a new client connection"""
-        with self._lock:
-            if len(self.clients) >= self.max_connections:
-                raise Exception("Maximum connections reached")
-            self.clients.add(client_ws)
-            logger.info(f"Client connected. Total: {len(self.clients)}")
-    
-    def remove_client(self, client_ws):
-        """Remove a client connection"""
-        with self._lock:
-            self.clients.discard(client_ws)
-            # Clean up subscriptions
-            if client_ws in self.subscriptions:
-                del self.subscriptions[client_ws]
-            logger.info(f"Client disconnected. Total: {len(self.clients)}")
-    
-    def broadcast(self, message: Union[str, dict]):
-        """Broadcast message to all connected clients"""
-        if isinstance(message, dict):
-            message = json.dumps(message)
-        
-        with self._lock:
-            disconnected = []
-            for client in self.clients:
-                try:
-                    client.send(message)
-                except Exception as e:
-                    logger.debug(f"Failed to send to client: {e}")
-                    disconnected.append(client)
-            
-            for client in disconnected:
-                self.remove_client(client)
-    
-    def start_heartbeat(self):
-        """Start heartbeat to keep connections alive"""
-        def heartbeat_loop():
-            while self._running:
-                time.sleep(self.heartbeat_interval)
-                self.broadcast({"type": "heartbeat", "timestamp": time.time()})
-        
-        self._running = True
-        threading.Thread(target=heartbeat_loop, daemon=True).start()
-    
-    def stop_heartbeat(self):
-        """Stop heartbeat"""
-        self._running = False
-
-# Initialize WebSocket manager
-ws_manager = WebSocketManager()
-ws_manager.start_heartbeat()
-
-# ========================= Market Data Helpers =========================
-
-def calculate_indicators(candles: List) -> Dict[str, Any]:
-    """Calculate technical indicators"""
+def calculate_advanced_indicators(candles: List) -> Dict[str, Any]:
+    """
+    Calculate advanced technical indicators for AI analysis.
+    """
     if not candles or len(candles) < 2:
         return {}
     
     try:
-        closes = np.array([c[4] for c in candles])
-        highs = np.array([c[2] for c in candles])
-        lows = np.array([c[3] for c in candles])
-        volumes = np.array([c[5] for c in candles]) if len(candles[0]) > 5 else None
+        # Extract OHLCV data
+        closes = [c[4] for c in candles]  # Close prices
+        highs = [c[2] for c in candles]   # High prices
+        lows = [c[3] for c in candles]    # Low prices
+        volumes = [c[5] for c in candles] if len(candles[0]) > 5 else []
         
+        # Calculate basic indicators
         indicators = {
-            "current_price": float(closes[-1]),
-            "price_change": float(closes[-1] - closes[-2]),
-            "price_change_pct": float((closes[-1] - closes[-2]) / closes[-2] * 100) if closes[-2] != 0 else 0
+            "sma_10": np.mean(closes[-10:]) if len(closes) >= 10 else None,
+            "sma_20": np.mean(closes[-20:]) if len(closes) >= 20 else None,
+            "sma_50": np.mean(closes[-50:]) if len(closes) >= 50 else None,
+            "current_price": closes[-1],
+            "price_change": closes[-1] - closes[-2] if len(closes) >= 2 else 0,
+            "price_change_pct": ((closes[-1] - closes[-2]) / closes[-2] * 100) if len(closes) >= 2 and closes[-2] != 0 else 0,
+            "high_20": max(highs[-20:]) if len(highs) >= 20 else max(highs),
+            "low_20": min(lows[-20:]) if len(lows) >= 20 else min(lows),
+            "avg_volume": np.mean(volumes[-20:]) if len(volumes) >= 20 else np.mean(volumes) if volumes else None,
+            "volume_ratio": volumes[-1] / np.mean(volumes[-20:]) if len(volumes) >= 20 and np.mean(volumes[-20:]) != 0 else None
         }
         
-        # Moving averages
-        for period in [10, 20, 50]:
-            if len(closes) >= period:
-                indicators[f"sma_{period}"] = float(np.mean(closes[-period:]))
-        
-        # RSI
+        # Calculate RSI (14-period)
         if len(closes) >= 15:
-            deltas = np.diff(closes)
-            gains = np.where(deltas > 0, deltas, 0)
-            losses = np.where(deltas < 0, -deltas, 0)
+            price_changes = [closes[i] - closes[i-1] for i in range(1, len(closes))]
+            gains = [change if change > 0 else 0 for change in price_changes]
+            losses = [-change if change < 0 else 0 for change in price_changes]
             
             avg_gain = np.mean(gains[-14:])
             avg_loss = np.mean(losses[-14:])
             
             if avg_loss != 0:
                 rs = avg_gain / avg_loss
-                indicators["rsi"] = float(100 - (100 / (1 + rs)))
+                indicators["rsi"] = 100 - (100 / (1 + rs))
             else:
-                indicators["rsi"] = 100.0 if avg_gain > 0 else 50.0
-        
-        # Bollinger Bands
-        if len(closes) >= 20:
-            sma_20 = np.mean(closes[-20:])
-            std_20 = np.std(closes[-20:])
-            indicators["bb_upper"] = float(sma_20 + 2 * std_20)
-            indicators["bb_lower"] = float(sma_20 - 2 * std_20)
-            indicators["bb_middle"] = float(sma_20)
-        
-        # Volume indicators
-        if volumes is not None and len(volumes) >= 20:
-            indicators["volume_avg"] = float(np.mean(volumes[-20:]))
-            indicators["volume_ratio"] = float(volumes[-1] / np.mean(volumes[-20:])) if np.mean(volumes[-20:]) != 0 else 1.0
+                indicators["rsi"] = 100 if avg_gain > 0 else 50
         
         return indicators
         
     except Exception as e:
-        logger.error(f"Error calculating indicators: {e}")
+        app.logger.error(f"Error calculating indicators: {e}")
         return {}
 
-# ========================= API Routes - Authentication =========================
+# --- Storage and Token Management ---
 
-@app.route('/api/auth/login')
-def fyers_login():
-    """Initiate Fyers OAuth flow"""
-    if not all([app.config['FYERS_CLIENT_ID'], app.config['FYERS_REDIRECT_URI'], app.config['FYERS_SECRET_KEY']]):
-        return jsonify({"error": "Fyers API credentials not configured"}), 500
+def store_tokens(access_token, refresh_token):
+    global ACCESS_TOKEN, REFRESH_TOKEN
+    ACCESS_TOKEN = access_token
+    REFRESH_TOKEN = refresh_token
     
+    app.logger.info("Tokens updated. For persistence, save these securely:")
+    try:
+        app.logger.info(f"New Access Token: {ACCESS_TOKEN[:10]}...")
+    except Exception:
+        app.logger.info("New Access Token: (hidden)")
+    try:
+        app.logger.info(f"New Refresh Token: {REFRESH_TOKEN[:10]}...")
+    except Exception:
+        app.logger.info("New Refresh Token: (hidden)")
+
+def load_tokens():
+    global ACCESS_TOKEN, REFRESH_TOKEN
+    pass
+
+# Load tokens at startup
+load_tokens()
+
+def initialize_fyers_model(token=None):
+    global fyers_instance, ACCESS_TOKEN, REFRESH_TOKEN
+
+    token_to_use = token if token else ACCESS_TOKEN
+
+    if token_to_use:
+        try:
+            try:
+                fyers_instance = fyersModel.FyersModel(token=token_to_use, is_async=False, client_id=CLIENT_ID, log_path="")
+            except TypeError:
+                fyers_instance = fyersModel.FyersModel(access_token=token_to_use, is_async=False, client_id=CLIENT_ID, log_path="")
+            app.logger.info("FyersModel initialized with access token.")
+            return True
+        except Exception as e:
+            app.logger.error(f"Failed to initialize fyers_model with provided token: {e}", exc_info=True)
+            return False
+    elif REFRESH_TOKEN and CLIENT_ID and SECRET_KEY:
+        app.logger.info("No access token provided or found, attempting to use refresh token.")
+        if refresh_access_token():
+            app.logger.info("FyersModel initialized with refreshed access token.")
+            return True
+        else:
+            app.logger.error("Could not initialize FyersModel: Refresh token failed.")
+            return False
+    else:
+        app.logger.warning("FyersModel could not be initialized: No access token or refresh token available.")
+        return False
+
+def refresh_access_token():
+    global ACCESS_TOKEN, REFRESH_TOKEN
+    if not REFRESH_TOKEN:
+        app.logger.error("Cannot refresh token: No refresh token available.")
+        return False
+
     session = fyersModel.SessionModel(
-        client_id=app.config['FYERS_CLIENT_ID'],
-        redirect_uri=app.config['FYERS_REDIRECT_URI'],
+        client_id=CLIENT_ID,
+        redirect_uri=REDIRECT_URI,
         response_type="code",
-        state="fyers_state",
-        secret_key=app.config['FYERS_SECRET_KEY'],
+        state="refresh_state", 
+        secret_key=SECRET_KEY,
+        grant_type="refresh_token"
+    )
+    session.set_token(REFRESH_TOKEN)
+
+    try:
+        app.logger.info(f"Attempting to refresh access token using refresh token: {REFRESH_TOKEN[:5]}...")
+        response = session.generate_token()
+
+        if response and response.get("s") == "ok":
+            new_access_token = response["access_token"]
+            new_refresh_token = response.get("refresh_token", REFRESH_TOKEN)
+
+            store_tokens(new_access_token, new_refresh_token)
+            initialize_fyers_model(new_access_token)
+            app.logger.info("Access token refreshed successfully.")
+            return True
+        else:
+            app.logger.error(f"Failed to refresh access token. Response: {response}")
+            return False
+    except Exception as e:
+        app.logger.error(f"Error during access token refresh: {e}", exc_info=True)
+        return False
+
+# Initialize Fyers model at startup
+initialize_fyers_model()
+
+# --- Gemini AI Endpoints ---
+
+@app.route('/api/ai/analyze', methods=['POST'])
+def ai_analyze():
+    """
+    Analyze market data using Gemini AI.
+    
+    Request body:
+    {
+        "data": {...},  # Market data to analyze
+        "analysis_type": "general|technical|sentiment|risk"
+    }
+    """
+    if not gemini_model:
+        return jsonify({"error": "AI model not initialized. Please set GEMINI_API_KEY."}), 503
+    
+    request_data = request.json
+    if not request_data or not request_data.get("data"):
+        return jsonify({"error": "Missing 'data' in request body"}), 400
+    
+    analysis_type = request_data.get("analysis_type", "general")
+    data = request_data.get("data")
+    
+    result = analyze_market_data_with_ai(data, analysis_type)
+    return jsonify(result)
+
+@app.route('/api/ai/trading-signals', methods=['POST'])
+def ai_trading_signals():
+    """
+    Generate trading signals using AI.
+    
+    Request body:
+    {
+        "symbol": "NSE:SBIN-EQ",
+        "use_live_data": true  # Optional, will fetch current data if true
+    }
+    """
+    if not gemini_model:
+        return jsonify({"error": "AI model not initialized. Please set GEMINI_API_KEY."}), 503
+    
+    request_data = request.json
+    symbol = request_data.get("symbol")
+    use_live_data = request_data.get("use_live_data", False)
+    
+    if not symbol:
+        return jsonify({"error": "Missing 'symbol' in request body"}), 400
+    
+    try:
+        # Fetch historical data if requested
+        if use_live_data and fyers_instance:
+            # Get current quote
+            quote_result = make_fyers_api_call(fyers_instance.quotes, data={"symbols": symbol})
+            current_price = None
+            if quote_result and isinstance(quote_result, dict):
+                quote_data = quote_result.get("d", [{}])[0]
+                current_price = quote_data.get("v", {}).get("lp", 0)
+            
+            # Get historical data
+            end_time = int(time.time())
+            start_time = end_time - (30 * 24 * 60 * 60)  # 30 days of data
+            
+            history_data = {
+                "symbol": symbol,
+                "resolution": "1D",
+                "date_format": 0,
+                "range_from": str(start_time),
+                "range_to": str(end_time),
+                "cont_flag": 1
+            }
+            
+            history_result = make_fyers_api_call(fyers_instance.history, data=history_data)
+            
+            if history_result and isinstance(history_result, dict):
+                candles = history_result.get("candles", [])
+                if not current_price and candles:
+                    current_price = candles[-1][4]  # Last close price
+                
+                signals = generate_trading_signals_with_ai(symbol, candles, current_price or 0)
+                
+                # Add technical indicators
+                indicators = calculate_advanced_indicators(candles)
+                signals["technical_indicators"] = indicators
+                
+                return jsonify(signals)
+            else:
+                return jsonify({"error": "Failed to fetch historical data"}), 500
+        else:
+            # Use provided data or return error
+            historical_data = request_data.get("historical_data", [])
+            current_price = request_data.get("current_price", 0)
+            
+            if not historical_data:
+                return jsonify({"error": "Either enable 'use_live_data' or provide 'historical_data' and 'current_price'"}), 400
+            
+            signals = generate_trading_signals_with_ai(symbol, historical_data, current_price)
+            return jsonify(signals)
+            
+    except Exception as e:
+        app.logger.error(f"Error generating trading signals: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/ai/chat', methods=['POST'])
+def ai_chat():
+    """
+    Chat with Gemini AI about trading and markets.
+    
+    Request body:
+    {
+        "message": "What's your analysis on NIFTY50?",
+        "context": {...}  # Optional context data
+    }
+    """
+    if not gemini_model:
+        return jsonify({"error": "AI model not initialized. Please set GEMINI_API_KEY."}), 503
+    
+    request_data = request.json
+    message = request_data.get("message")
+    context = request_data.get("context", {})
+    
+    if not message:
+        return jsonify({"error": "Missing 'message' in request body"}), 400
+    
+    try:
+        # Prepare the prompt with trading context
+        prompt = f"""
+        You are an expert trading advisor and market analyst. 
+        Please provide helpful, accurate, and actionable insights.
+        
+        User Question: {message}
+        """
+        
+        if context:
+            prompt += f"\n\nAdditional Context:\n{json.dumps(context, indent=2)}"
+        
+        prompt += "\n\nProvide a clear, structured response with specific insights and recommendations where applicable."
+        
+        response = gemini_model.generate_content(prompt)
+        
+        return jsonify({
+            "question": message,
+            "response": response.text,
+            "timestamp": datetime.datetime.now().isoformat()
+        })
+        
+    except Exception as e:
+        app.logger.error(f"AI chat error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/ai/portfolio-analysis', methods=['POST'])
+def ai_portfolio_analysis():
+    """
+    Analyze portfolio using AI and provide recommendations.
+    
+    Request body:
+    {
+        "holdings": [...],  # Portfolio holdings
+        "risk_profile": "conservative|moderate|aggressive"
+    }
+    """
+    if not gemini_model:
+        return jsonify({"error": "AI model not initialized. Please set GEMINI_API_KEY."}), 503
+    
+    request_data = request.json
+    holdings = request_data.get("holdings", [])
+    risk_profile = request_data.get("risk_profile", "moderate")
+    
+    if not holdings:
+        # Try to fetch from Fyers if authenticated
+        if fyers_instance:
+            holdings_result = make_fyers_api_call(fyers_instance.holdings)
+            if holdings_result and isinstance(holdings_result, dict):
+                holdings = holdings_result.get("holdings", [])
+    
+    if not holdings:
+        return jsonify({"error": "No holdings data available"}), 400
+    
+    try:
+        prompt = f"""
+        Analyze the following portfolio and provide comprehensive recommendations:
+        
+        Portfolio Holdings:
+        {json.dumps(holdings, indent=2)}
+        
+        Risk Profile: {risk_profile}
+        
+        Please provide:
+        1. Portfolio composition analysis
+        2. Risk assessment
+        3. Diversification analysis
+        4. Sector allocation review
+        5. Rebalancing recommendations
+        6. Specific buy/sell/hold recommendations for each holding
+        7. New investment opportunities based on the risk profile
+        8. Expected returns and risk metrics
+        
+        Format the response in a clear, actionable manner.
+        """
+        
+        response = gemini_model.generate_content(prompt)
+        
+        return jsonify({
+            "portfolio_analysis": response.text,
+            "risk_profile": risk_profile,
+            "holdings_count": len(holdings),
+            "timestamp": datetime.datetime.now().isoformat()
+        })
+        
+    except Exception as e:
+        app.logger.error(f"Portfolio analysis error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/ai/market-summary', methods=['GET'])
+def ai_market_summary():
+    """
+    Get AI-generated market summary and outlook.
+    """
+    if not gemini_model:
+        return jsonify({"error": "AI model not initialized. Please set GEMINI_API_KEY."}), 503
+    
+    try:
+        # You can enhance this by fetching real market data
+        prompt = f"""
+        Provide a comprehensive market summary for Indian markets as of {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}:
+        
+        Include:
+        1. Overall market sentiment and trend
+        2. Key indices performance outlook (NIFTY, SENSEX, BANKNIFTY)
+        3. Sector rotation analysis
+        4. Global market impact on Indian markets
+        5. Key events and their potential impact
+        6. FII/DII activity insights
+        7. Currency and commodity outlook
+        8. Top opportunities for the day/week
+        9. Key risks to watch
+        10. Recommended trading strategies for current market conditions
+        
+        Be specific with levels, percentages, and actionable insights.
+        """
+        
+        response = gemini_model.generate_content(prompt)
+        
+        return jsonify({
+            "market_summary": response.text,
+            "generated_at": datetime.datetime.now().isoformat()
+        })
+        
+    except Exception as e:
+        app.logger.error(f"Market summary error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+# --- Helper function to wrap Fyers API calls with refresh logic ---
+def make_fyers_api_call(api_method, *args, **kwargs):
+    global fyers_instance
+    if not fyers_instance:
+        app.logger.warning("Fyers API not initialized. Attempting to initialize.")
+        if not initialize_fyers_model():
+            return jsonify({"error": "Fyers API not initialized. Please authenticate first."}), 401
+
+    try:
+        return api_method(*args, **kwargs)
+    except Exception as e:
+        error_message = str(e).lower()
+
+        if "token" in error_message or "authenticated" in error_message or "login" in error_message or "invalid_access_token" in error_message:
+            app.logger.warning(f"Access token expired or invalid. Attempting to refresh. Original error: {e}")
+            if refresh_access_token():
+                app.logger.info("Token refreshed, retrying original request.")
+                return api_method(*args, **kwargs)
+            else:
+                app.logger.error("Token refresh failed. Cannot fulfill request.")
+                return jsonify({"error": "Fyers API token expired and refresh failed. Please re-authenticate."}), 401
+        else:
+            app.logger.error(f"Non-token related Fyers API error: {e}", exc_info=True)
+            return jsonify({"error": f"Fyers API error: {str(e)}"}), 500
+
+# --- Fyers Authentication Flow Endpoints ---
+
+@app.route('/fyers-login')
+def fyers_login():
+    """Initiates the Fyers authentication flow."""
+    if not CLIENT_ID or not REDIRECT_URI or not SECRET_KEY:
+        app.logger.error("Fyers API credentials not fully configured for login.")
+        return jsonify({"error": "Fyers API credentials not fully configured on the server."}), 500
+
+    session = fyersModel.SessionModel(
+        client_id=CLIENT_ID,
+        redirect_uri=REDIRECT_URI,
+        response_type="code",
+        state="fyers_proxy_state",
+        secret_key=SECRET_KEY,
         grant_type="authorization_code"
     )
-    
-    auth_url = session.generate_authcode()
-    logger.info("Redirecting to Fyers authentication")
-    return redirect(auth_url)
+    generate_token_url = session.generate_authcode()
+    app.logger.info(f"Redirecting to Fyers login: {generate_token_url}")
+    return redirect(generate_token_url)
 
-@app.route('/api/auth/callback')
-def fyers_callback():
-    """Handle Fyers OAuth callback"""
+@app.route('/fyers-auth-callback')
+def fyers_auth_callback():
+    """Callback endpoint after the user logs in on Fyers."""
     auth_code = request.args.get('auth_code')
     state = request.args.get('state')
     error = request.args.get('error')
-    
+
     if error:
-        logger.error(f"Authentication error: {error}")
-        return jsonify({"error": f"Authentication failed: {error}"}), 400
-    
+        app.logger.error(f"Fyers authentication failed: {error}")
+        return jsonify({"error": f"Fyers authentication failed: {error}"}), 400
     if not auth_code:
-        return jsonify({"error": "No authorization code received"}), 400
-    
+        app.logger.error("No auth_code received from Fyers.")
+        return jsonify({"error": "No auth_code received from Fyers."}), 400
+
+    session = fyersModel.SessionModel(
+        client_id=CLIENT_ID,
+        redirect_uri=REDIRECT_URI,
+        response_type="code",
+        state=state,
+        secret_key=SECRET_KEY,
+        grant_type="authorization_code"
+    )
+    session.set_token(auth_code)
     try:
-        session = fyersModel.SessionModel(
-            client_id=app.config['FYERS_CLIENT_ID'],
-            redirect_uri=app.config['FYERS_REDIRECT_URI'],
-            response_type="code",
-            state=state,
-            secret_key=app.config['FYERS_SECRET_KEY'],
-            grant_type="authorization_code"
-        )
-        session.set_token(auth_code)
         response = session.generate_token()
-        
+
         if response and response.get("s") == "ok":
-            access_token = response["access_token"]
-            refresh_token = response["refresh_token"]
-            
-            # Store tokens securely
-            token_manager.store_token("fyers_access", access_token)
-            token_manager.store_token("fyers_refresh", refresh_token)
-            
-            # Initialize Fyers
-            fyers_manager.initialize(access_token)
-            
-            logger.info("Authentication successful")
-            return jsonify({"message": "Authentication successful", "authenticated": True})
+            new_access_token = response["access_token"]
+            new_refresh_token = response["refresh_token"]
+
+            store_tokens(new_access_token, new_refresh_token)
+            initialize_fyers_model(new_access_token)
+
+            app.logger.info("Fyers tokens generated successfully!")
+            return jsonify({"message": "Fyers tokens generated successfully!", "access_token_available": True})
         else:
-            logger.error(f"Token generation failed: {response}")
-            return jsonify({"error": "Failed to generate tokens"}), 500
-            
+            app.logger.error(f"Failed to generate Fyers tokens. Response: {response}")
+            return jsonify({"error": f"Failed to generate Fyers tokens. Response: {response}"}), 500
+
     except Exception as e:
-        logger.error(f"Authentication error: {e}")
-        return jsonify({"error": str(e)}), 500
+        app.logger.error(f"Error generating Fyers access token: {e}", exc_info=True)
+        return jsonify({"error": f"Failed to generate Fyers access token: {str(e)}"}), 500
 
-# ========================= API Routes - Market Data =========================
+# --- Fyers Data Endpoints ---
 
-@app.route('/api/market/profile')
-@require_auth
-@limiter.limit("10 per minute")
+@app.route('/api/fyers/profile')
 def get_profile():
-    """Get user profile"""
-    try:
-        result = fyers_manager.make_api_call(fyers_manager.fyers_instance.get_profile)
-        return jsonify(result)
-    except Exception as e:
-        logger.error(f"Profile API error: {e}")
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/api/market/funds')
-@require_auth
-@limiter.limit("20 per minute")
-def get_funds():
-    """Get funds information"""
-    try:
-        result = fyers_manager.make_api_call(fyers_manager.fyers_instance.funds)
-        return jsonify(result)
-    except Exception as e:
-        logger.error(f"Funds API error: {e}")
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/api/market/holdings')
-@require_auth
-@limiter.limit("20 per minute")
-def get_holdings():
-    """Get holdings"""
-    try:
-        result = fyers_manager.make_api_call(fyers_manager.fyers_instance.holdings)
-        return jsonify(result)
-    except Exception as e:
-        logger.error(f"Holdings API error: {e}")
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/api/market/history', methods=['POST'])
-@require_auth
-@limiter.limit("30 per minute")
-@validate_input(HistoryRequestSchema)
-def get_history():
-    """Get historical data with optional AI analysis"""
-    data = request.validated_data
-    
-    try:
-        # Fetch historical data
-        history_result = fyers_manager.make_api_call(
-            fyers_manager.fyers_instance.history,
-            data=data
-        )
-        
-        if data.get('include_ai_analysis') and history_result.get('candles'):
-            # Calculate indicators
-            indicators = calculate_indicators(history_result['candles'])
-            
-            # Get AI analysis
-            analysis_data = {
-                "symbol": data['symbol'],
-                "indicators": indicators,
-                "candles_count": len(history_result['candles'])
-            }
-            
-            ai_analysis = ai_manager.analyze(
-                analysis_data,
-                data.get('ai_analysis_type', 'technical')
-            )
-            
-            history_result['indicators'] = indicators
-            history_result['ai_analysis'] = ai_analysis
-        
-        return jsonify(history_result)
-        
-    except Exception as e:
-        logger.error(f"History API error: {e}")
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/api/market/quotes')
-@require_auth
-@limiter.limit("50 per minute")
-@cache.cached(timeout=10, query_string=True)
-def get_quotes():
-    """Get real-time quotes"""
-    symbols = request.args.get('symbols')
-    if not symbols:
-        return jsonify({"error": "Missing symbols parameter"}), 400
-    
-    try:
-        result = fyers_manager.make_api_call(
-            fyers_manager.fyers_instance.quotes,
-            data={"symbols": symbols}
-        )
-        return jsonify(result)
-    except Exception as e:
-        logger.error(f"Quotes API error: {e}")
-        return jsonify({"error": str(e)}), 500
-
-# ========================= API Routes - Commodities =========================
-
-@app.route('/api/commodities/list')
-@require_auth
-@limiter.limit("10 per minute")
-@cache.cached(timeout=3600)
-def get_commodities_list():
-    """Get list of available commodities"""
-    commodities = {
-        "energy": [
-            {"symbol": "MCX:CRUDEOIL", "name": "Crude Oil"},
-            {"symbol": "MCX:NATURALGAS", "name": "Natural Gas"}
-        ],
-        "metals": [
-            {"symbol": "MCX:GOLD", "name": "Gold"},
-            {"symbol": "MCX:SILVER", "name": "Silver"},
-            {"symbol": "MCX:COPPER", "name": "Copper"},
-            {"symbol": "MCX:ZINC", "name": "Zinc"},
-            {"symbol": "MCX:LEAD", "name": "Lead"},
-            {"symbol": "MCX:NICKEL", "name": "Nickel"},
-            {"symbol": "MCX:ALUMINIUM", "name": "Aluminium"}
-        ],
-        "agriculture": [
-            {"symbol": "MCX:COTTON", "name": "Cotton"},
-            {"symbol": "MCX:CPO", "name": "Crude Palm Oil"},
-            {"symbol": "MCX:MENTHAOIL", "name": "Mentha Oil"},
-            {"symbol": "MCX:CARDAMOM", "name": "Cardamom"}
-        ]
-    }
-    return jsonify(commodities)
-
-@app.route('/api/commodities/quotes')
-@require_auth
-@limiter.limit("30 per minute")
-def get_commodity_quotes():
-    """Get commodity quotes"""
-    symbols = request.args.get('symbols')
-    if not symbols:
-        return jsonify({"error": "Missing symbols parameter"}), 400
-    
-    # Validate commodity symbols
-    commodity_symbols = [s for s in symbols.split(',') if s.startswith('MCX:')]
-    if not commodity_symbols:
-        return jsonify({"error": "No valid commodity symbols provided"}), 400
-    
-    try:
-        result = fyers_manager.make_api_call(
-            fyers_manager.fyers_instance.quotes,
-            data={"symbols": ','.join(commodity_symbols)}
-        )
-        return jsonify(result)
-    except Exception as e:
-        logger.error(f"Commodity quotes error: {e}")
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/api/commodities/history', methods=['POST'])
-@require_auth
-@limiter.limit("20 per minute")
-@validate_input(HistoryRequestSchema)
-def get_commodity_history():
-    """Get commodity historical data"""
-    data = request.validated_data
-    
-    # Validate commodity symbol
-    if not data['symbol'].startswith('MCX:'):
-        return jsonify({"error": "Invalid commodity symbol"}), 400
-    
-    try:
-        result = fyers_manager.make_api_call(
-            fyers_manager.fyers_instance.history,
-            data=data
-        )
-        
-        # Add commodity-specific analysis if requested
-        if data.get('include_ai_analysis'):
-            analysis = ai_manager.analyze(
-                {"commodity_data": result, "symbol": data['symbol']},
-                "commodity"
-            )
-            result['ai_analysis'] = analysis
-        
-        return jsonify(result)
-        
-    except Exception as e:
-        logger.error(f"Commodity history error: {e}")
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/api/commodities/order', methods=['POST'])
-@require_auth
-@limiter.limit("10 per minute")
-@validate_input(CommoditySchema)
-def place_commodity_order():
-    """Place commodity order"""
-    data = request.validated_data
-    
-    try:
-        order_data = {
-            "symbol": data['symbol'],
-            "qty": data['qty'],
-            "type": 2 if data['type'] == "FUTURES" else 4,  # Market or limit
-            "side": 1,  # Buy
-            "productType": "INTRADAY",
-            "validity": "DAY"
-        }
-        
-        result = fyers_manager.make_api_call(
-            fyers_manager.fyers_instance.place_order,
-            data=order_data
-        )
-        return jsonify(result)
-        
-    except Exception as e:
-        logger.error(f"Commodity order error: {e}")
-        return jsonify({"error": str(e)}), 500
-
-# ========================= API Routes - Mutual Funds =========================
-
-@app.route('/api/mutual-funds/list')
-@require_auth
-@limiter.limit("10 per minute")
-@cache.cached(timeout=3600)
-def get_mutual_funds_list():
-    """Get list of available mutual funds"""
-    mutual_funds = {
-        "equity": [
-            {"symbol": "INF200K01VK6", "name": "SBI Blue Chip Fund", "category": "Large Cap"},
-            {"symbol": "INF179K01AU2", "name": "HDFC Mid-Cap Opportunities", "category": "Mid Cap"},
-            {"symbol": "INF090I01BJ9", "name": "Axis Small Cap Fund", "category": "Small Cap"}
-        ],
-        "debt": [
-            {"symbol": "INF277K01ZA9", "name": "ICICI Prudential Short Term", "category": "Short Duration"},
-            {"symbol": "INF179K01LS8", "name": "HDFC Corporate Bond", "category": "Corporate Bond"}
-        ],
-        "hybrid": [
-            {"symbol": "INF200K01RZ0", "name": "SBI Equity Hybrid Fund", "category": "Aggressive Hybrid"},
-            {"symbol": "INF179K01BB9", "name": "HDFC Balanced Advantage", "category": "Dynamic Asset"}
-        ],
-        "elss": [
-            {"symbol": "INF090I01239", "name": "Axis Tax Saver", "category": "ELSS"},
-            {"symbol": "INF109K01BQ5", "name": "Mirae Asset Tax Saver", "category": "ELSS"}
-        ]
-    }
-    return jsonify(mutual_funds)
-
-@app.route('/api/mutual-funds/nav')
-@require_auth
-@limiter.limit("30 per minute")
-def get_mutual_fund_nav():
-    """Get mutual fund NAV"""
-    symbols = request.args.get('symbols')
-    if not symbols:
-        return jsonify({"error": "Missing symbols parameter"}), 400
-    
-    try:
-        # Mutual funds use different API endpoint
-        # This is a placeholder - actual implementation depends on Fyers MF API
-        result = {
-            "funds": [
-                {
-                    "symbol": symbol,
-                    "nav": 150.25,  # Placeholder
-                    "date": datetime.datetime.now().isoformat(),
-                    "change": 1.25,
-                    "change_pct": 0.84
-                }
-                for symbol in symbols.split(',')
-            ]
-        }
-        return jsonify(result)
-        
-    except Exception as e:
-        logger.error(f"Mutual fund NAV error: {e}")
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/api/mutual-funds/order', methods=['POST'])
-@require_auth
-@limiter.limit("10 per minute")
-@validate_input(MutualFundSchema)
-def place_mutual_fund_order():
-    """Place mutual fund order (SIP/Lumpsum)"""
-    data = request.validated_data
-    
-    try:
-        # Mutual fund orders are different from regular orders
-        # This is a placeholder - actual implementation depends on Fyers MF API
-        order_data = {
-            "symbol": data['symbol'],
-            "amount": data['amount'],
-            "type": data['type'],
-            "folio_number": data.get('folio_number')
-        }
-        
-        # Simulate order placement
-        result = {
-            "order_id": f"MF{int(time.time())}",
-            "status": "success",
-            "message": f"{data['type']} order placed successfully",
-            "details": order_data
-        }
-        
-        return jsonify(result)
-        
-    except Exception as e:
-        logger.error(f"Mutual fund order error: {e}")
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/api/mutual-funds/sip', methods=['GET'])
-@require_auth
-@limiter.limit("20 per minute")
-def get_sip_details():
-    """Get SIP details"""
-    try:
-        # Placeholder for SIP details
-        sips = [
-            {
-                "sip_id": "SIP001",
-                "fund_name": "SBI Blue Chip Fund",
-                "amount": 5000,
-                "frequency": "Monthly",
-                "start_date": "2024-01-01",
-                "next_date": "2024-12-01",
-                "status": "Active"
-            }
-        ]
-        return jsonify({"sips": sips})
-        
-    except Exception as e:
-        logger.error(f"SIP details error: {e}")
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/api/mutual-funds/performance', methods=['POST'])
-@require_auth
-@limiter.limit("20 per minute")
-def get_mutual_fund_performance():
-    """Get mutual fund performance with AI analysis"""
-    data = request.json
-    symbol = data.get('symbol')
-    
-    if not symbol:
-        return jsonify({"error": "Missing symbol"}), 400
-    
-    try:
-        # Placeholder performance data
-        performance = {
-            "symbol": symbol,
-            "returns": {
-                "1D": 0.5,
-                "1W": 1.2,
-                "1M": 3.5,
-                "3M": 8.2,
-                "6M": 12.5,
-                "1Y": 18.3,
-                "3Y": 45.2,
-                "5Y": 85.6
-            },
-            "risk_metrics": {
-                "sharpe_ratio": 1.45,
-                "beta": 0.95,
-                "alpha": 2.3,
-                "standard_deviation": 14.5
-            }
-        }
-        
-        # Add AI analysis
-        if data.get('include_ai_analysis'):
-            analysis = ai_manager.analyze(performance, "mutual_fund")
-            performance['ai_analysis'] = analysis
-        
-        return jsonify(performance)
-        
-    except Exception as e:
-        logger.error(f"MF performance error: {e}")
-        return jsonify({"error": str(e)}), 500
-
-# ========================= API Routes - Orders =========================
-
-@app.route('/api/orders/place', methods=['POST'])
-@require_auth
-@limiter.limit("20 per minute")
-@validate_input(OrderSchema)
-def place_order():
-    """Place order for stocks"""
-    data = request.validated_data
-    
-    try:
-        result = fyers_manager.make_api_call(
-            fyers_manager.fyers_instance.place_order,
-            data=data
-        )
-        return jsonify(result)
-    except Exception as e:
-        logger.error(f"Order placement error: {e}")
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/api/orders/modify', methods=['PATCH'])
-@require_auth
-@limiter.limit("20 per minute")
-def modify_order():
-    """Modify existing order"""
-    data = request.json
-    if not data or not data.get("id"):
-        return jsonify({"error": "Order ID required"}), 400
-    
-    try:
-        result = fyers_manager.make_api_call(
-            fyers_manager.fyers_instance.modify_order,
-            data=data
-        )
-        return jsonify(result)
-    except Exception as e:
-        logger.error(f"Order modification error: {e}")
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/api/orders/cancel', methods=['DELETE'])
-@require_auth
-@limiter.limit("20 per minute")
-def cancel_order():
-    """Cancel order"""
-    data = request.json
-    if not data or not data.get("id"):
-        return jsonify({"error": "Order ID required"}), 400
-    
-    try:
-        result = fyers_manager.make_api_call(
-            fyers_manager.fyers_instance.cancel_order,
-            data=data
-        )
-        return jsonify(result)
-    except Exception as e:
-        logger.error(f"Order cancellation error: {e}")
-        return jsonify({"error": str(e)}), 500
-
-# ========================= API Routes - AI Analysis =========================
-
-@app.route('/api/ai/analyze', methods=['POST'])
-@require_auth
-@limiter.limit("10 per minute")
-def ai_analyze():
-    """Analyze market data with AI"""
-    data = request.json
-    if not data or not data.get("data"):
-        return jsonify({"error": "Missing data for analysis"}), 400
-    
-    analysis_type = data.get("analysis_type", "general")
-    result = ai_manager.analyze(data["data"], analysis_type)
+    result = make_fyers_api_call(fyers_instance.get_profile)
+    if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], int):
+        return result
     return jsonify(result)
 
-@app.route('/api/ai/signals', methods=['POST'])
-@require_auth
-@limiter.limit("10 per minute")
-def ai_trading_signals():
-    """Generate AI trading signals"""
+@app.route('/api/fyers/funds')
+def get_funds():
+    result = make_fyers_api_call(fyers_instance.funds)
+    if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], int):
+        return result
+    return jsonify(result)
+
+@app.route('/api/fyers/holdings')
+def get_holdings():
+    result = make_fyers_api_call(fyers_instance.holdings)
+    if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], int):
+        return result
+    return jsonify(result)
+
+@app.route('/api/fyers/history', methods=['POST'])
+def get_history():
+    """
+    Fetch historical data with support for second-level, minute-level, and day-level resolutions.
+    Enhanced with optional AI analysis.
+    """
     data = request.json
-    symbol = data.get("symbol")
-    
-    if not symbol:
-        return jsonify({"error": "Missing symbol"}), 400
-    
+
+    required_params = ["symbol", "resolution", "date_format", "range_from", "range_to"]
+    if not data or not all(k in data for k in required_params):
+        app.logger.warning(f"Missing required parameters for history API. Received: {data}")
+        return jsonify({"error": f"Missing required parameters for history API. Need {', '.join(required_params)}."}), 400
+
+    # Check if AI analysis is requested
+    include_ai_analysis = data.get("include_ai_analysis", False)
+    ai_analysis_type = data.get("ai_analysis_type", "technical")
+
+    # Validate resolution
+    resolution = data["resolution"]
+    if resolution not in SECOND_RESOLUTIONS and resolution not in MINUTE_RESOLUTIONS and resolution not in DAY_RESOLUTIONS:
+        app.logger.warning(f"Unsupported resolution: {resolution}")
+        return jsonify({
+            "error": f"Unsupported resolution: {resolution}",
+            "supported_resolutions": {
+                "second": SECOND_RESOLUTIONS,
+                "minute": MINUTE_RESOLUTIONS,
+                "day": DAY_RESOLUTIONS
+            }
+        }), 400
+
     try:
-        # Fetch current data
-        quotes = fyers_manager.make_api_call(
-            fyers_manager.fyers_instance.quotes,
-            data={"symbols": symbol}
-        )
+        data["date_format"] = int(data["date_format"])
+    except ValueError:
+        app.logger.warning(f"Invalid 'date_format' received: {data.get('date_format')}")
+        return jsonify({"error": "Invalid 'date_format'. Must be 0 or 1."}), 400
+
+    # Handle incomplete candles for real-time data
+    if data["date_format"] == 0:
+        current_time = int(time.time())
+        requested_range_to = int(data["range_to"])
+        resolution = data["resolution"]
+
+        resolution_in_seconds = 0
+        if resolution.endswith('S'):
+            try:
+                resolution_in_seconds = int(resolution[:-1])
+                app.logger.info(f"Processing second-level resolution: {resolution} ({resolution_in_seconds} seconds)")
+            except ValueError:
+                app.logger.warning(f"Invalid numeric part in resolution ending with 'S': {resolution}")
+                return jsonify({"error": "Invalid resolution format."}), 400
+        elif resolution.isdigit():
+            resolution_in_seconds = int(resolution) * 60
+            app.logger.info(f"Processing minute-level resolution: {resolution} minutes ({resolution_in_seconds} seconds)")
+        elif resolution in ["D", "1D"]:
+            resolution_in_seconds = 24 * 60 * 60
+            app.logger.info(f"Processing day-level resolution: {resolution}")
+        else:
+            app.logger.warning(f"Unsupported resolution format for partial candle adjustment: {resolution}")
+            return jsonify({"error": "Unsupported resolution format."}), 400
+
+        if resolution_in_seconds > 0:
+            current_resolution_start_epoch = (current_time // resolution_in_seconds) * resolution_in_seconds
+
+            if requested_range_to >= current_resolution_start_epoch:
+                adjusted_range_to_epoch = current_resolution_start_epoch - 1
+
+                if adjusted_range_to_epoch < int(data["range_from"]):
+                    app.logger.info(f"Adjusted range_to ({adjusted_range_to_epoch}) is less than range_from ({data['range_from']}). No complete candles available.")
+                    return jsonify({"candles": [], "s": "ok", "message": "No complete candles available for the adjusted range."})
+
+                data["range_to"] = str(adjusted_range_to_epoch)
+                app.logger.info(f"Adjusted 'range_to' for resolution '{resolution}' to ensure completed candles: {requested_range_to} -> {data['range_to']}")
+
+    if "cont_flag" in data:
+        data["cont_flag"] = int(data["cont_flag"])
+    if "oi_flag" in data:
+        data["oi_flag"] = int(data["oi_flag"])
+
+    app.logger.info(f"Fetching history data: Symbol={data['symbol']}, Resolution={data['resolution']}, From={data['range_from']}, To={data['range_to']}")
+
+    result = make_fyers_api_call(fyers_instance.history, data=data)
+    if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], int):
+        return result
+    
+    # Log successful response
+    if result and result.get("s") == "ok":
+        candles_count = len(result.get("candles", []))
+        app.logger.info(f"Successfully fetched {candles_count} candles for {data['symbol']} at {data['resolution']} resolution")
         
-        # Get historical data
-        history_data = {
-            "symbol": symbol,
-            "resolution": "1D",
-            "date_format": 0,
-            "range_from": str(int(time.time()) - 30*24*60*60),
-            "range_to": str(int(time.time())),
-            "cont_flag": 1
+        # Add AI analysis if requested
+        if include_ai_analysis and gemini_model and candles_count > 0:
+            try:
+                candles = result.get("candles", [])
+                indicators = calculate_advanced_indicators(candles)
+                
+                analysis_data = {
+                    "symbol": data["symbol"],
+                    "resolution": data["resolution"],
+                    "candles_count": candles_count,
+                    "indicators": indicators,
+                    "latest_candle": candles[-1] if candles else None
+                }
+                
+                ai_analysis = analyze_market_data_with_ai(analysis_data, ai_analysis_type)
+                result["ai_analysis"] = ai_analysis
+                
+            except Exception as e:
+                app.logger.error(f"Failed to add AI analysis: {e}")
+                result["ai_analysis"] = {"error": str(e)}
+    
+    return jsonify(result)
+
+@app.route('/api/fyers/quotes', methods=['GET'])
+def get_quotes():
+    symbols = request.args.get('symbols')
+    include_ai_analysis = request.args.get('include_ai_analysis', 'false').lower() == 'true'
+    
+    if not symbols:
+        app.logger.warning("Missing 'symbols' parameter for quotes API.")
+        return jsonify({"error": "Missing 'symbols' parameter. Eg: /api/fyers/quotes?symbols=NSE:SBIN-EQ,NSE:TCS-EQ"}), 400
+
+    data = {"symbols": symbols}
+    result = make_fyers_api_call(fyers_instance.quotes, data=data)
+    if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], int):
+        return result
+    
+    # Add AI analysis if requested
+    if include_ai_analysis and gemini_model and result and result.get("d"):
+        try:
+            quotes_data = result.get("d", [])
+            ai_analysis = analyze_market_data_with_ai({"quotes": quotes_data}, "general")
+            result["ai_analysis"] = ai_analysis
+        except Exception as e:
+            app.logger.error(f"Failed to add AI analysis to quotes: {e}")
+            result["ai_analysis"] = {"error": str(e)}
+    
+    return jsonify(result)
+
+@app.route('/api/fyers/market_depth', methods=['GET'])
+def get_market_depth():
+    symbol = request.args.get('symbol')
+    ohlcv_flag = request.args.get('ohlcv_flag')
+
+    if not symbol or ohlcv_flag is None:
+        app.logger.warning(f"Missing 'symbol' or 'ohlcv_flag' parameter for market depth. Symbol: {symbol}, Flag: {ohlcv_flag}")
+        return jsonify({"error": "Missing 'symbol' or 'ohlcv_flag' parameter. Eg: /api/fyers/market_depth?symbol=NSE:SBIN-EQ&ohlcv_flag=1"}), 400
+
+    try:
+        ohlcv_flag = int(ohlcv_flag)
+        if ohlcv_flag not in [0, 1]:
+            raise ValueError("ohlcv_flag must be 0 or 1.")
+    except ValueError as ve:
+        app.logger.warning(f"Invalid 'ohlcv_flag' received for market depth: {ohlcv_flag}")
+        return jsonify({"error": f"Invalid 'ohlcv_flag': {ve}"}), 400
+
+    data = {
+        "symbol": symbol,
+        "ohlcv_flag": ohlcv_flag
+    }
+    result = make_fyers_api_call(fyers_instance.depth, data=data)
+    if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], int):
+        return result
+    return jsonify(result)
+
+@app.route('/api/fyers/option_chain', methods=['GET'])
+def get_option_chain():
+    symbol = request.args.get('symbol')
+    strikecount = request.args.get('strikecount')
+
+    if not symbol or not strikecount:
+        app.logger.warning(f"Missing 'symbol' or 'strikecount' parameter for option chain. Symbol: {symbol}, Strikecount: {strikecount}")
+        return jsonify({"error": "Missing 'symbol' or 'strikecount' parameter. Eg: /api/fyers/option_chain?symbol=NSE:TCS-EQ&strikecount=1"}), 400
+
+    try:
+        strikecount = int(strikecount)
+        if not (1 <= strikecount <= 50):
+            app.logger.warning(f"Invalid 'strikecount' for option chain: {strikecount}. Must be between 1 and 50.")
+            return jsonify({"error": "'strikecount' must be between 1 and 50."}), 400
+    except ValueError:
+        app.logger.warning(f"Invalid 'strikecount' received for option chain: {strikecount}. Must be an integer.")
+        return jsonify({"error": "Invalid 'strikecount'. Must be an integer."}), 400
+
+    data = {
+        "symbol": symbol,
+        "strikecount": strikecount
+    }
+    result = make_fyers_api_call(fyers_instance.optionchain, data=data)
+    if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], int):
+        return result
+    return jsonify(result)
+
+# --- Option helper functions ---
+def _find_option_in_chain(resp, option_symbol=None, strike=None, opt_type=None, expiry_ts=None):
+    """Helper to search option chain response for the requested option and return the node."""
+    if not resp or not isinstance(resp, dict):
+        return None
+
+    data = resp.get("data") if isinstance(resp, dict) else None
+    candidates = []
+    if data is None and "options_chain" in resp:
+        data = resp
+
+    if isinstance(data, dict):
+        for key in ["optionChain", "option_chain", "optionsChain", "options", "ce", "pe"]:
+            node = data.get(key)
+            if node:
+                if isinstance(node, list):
+                    candidates.extend(node)
+                elif isinstance(node, dict):
+                    for v in node.values():
+                        if isinstance(v, list):
+                            candidates.extend(v)
+                        else:
+                            candidates.append(v)
+
+    if not candidates and isinstance(resp.get("data"), list):
+        candidates.extend(resp.get("data"))
+
+    if not candidates and isinstance(resp, list):
+        candidates.extend(resp)
+
+    for item in candidates:
+        try:
+            symbol = item.get("symbol") or item.get("s") or item.get("name")
+        except Exception:
+            symbol = None
+        if option_symbol and symbol and option_symbol == symbol:
+            return item
+
+        try:
+            strike_val = item.get("strike") or item.get("strike_price") or item.get("strikePrice")
+            typ = item.get("option_type") or item.get("type") or item.get("opt_type") or item.get("instrument_type")
+            expiry = item.get("expiry") or item.get("expiry_date") or item.get("expiry_ts")
+        except Exception:
+            strike_val = None
+            typ = None
+            expiry = None
+
+        if strike is not None and strike_val is not None:
+            try:
+                if int(float(strike_val)) == int(float(strike)):
+                    if not opt_type or (typ and opt_type.upper() in str(typ).upper()):
+                        return item
+            except Exception:
+                pass
+
+        if expiry_ts and expiry:
+            try:
+                if int(expiry_ts) == int(expiry):
+                    if not strike or (strike_val and int(float(strike_val)) == int(float(strike))):
+                        return item
+            except Exception:
+                pass
+
+    return None
+
+@app.route('/api/fyers/option_premium', methods=['GET'])
+def get_option_premium():
+    """Returns option premium (LTP), IV, OI, change, and a small parsed payload for a single option contract."""
+    symbol = request.args.get('symbol')
+    underlying = request.args.get('underlying')
+    strike = request.args.get('strike')
+    opt_type = request.args.get('type')
+    expiry_ts = request.args.get('expiry_ts')
+
+    if not symbol and not (underlying and strike and opt_type):
+        return jsonify({"error": "Provide either symbol=<OPTION_SYMBOL> OR underlying=<SYM>&strike=<STRIKE>&type=<CE|PE>"}), 400
+
+    try:
+        if symbol:
+            depth_resp = make_fyers_api_call(fyers_instance.depth, data={"symbol": symbol, "ohlcv_flag": 1})
+            if isinstance(depth_resp, tuple) and len(depth_resp) == 2 and isinstance(depth_resp[1], int):
+                return depth_resp
+
+            premium = None
+            try:
+                d = depth_resp.get('data') if isinstance(depth_resp, dict) else None
+                if d:
+                    premium = d.get('ltp') or d.get('last_price') or d.get('close')
+                if not premium and isinstance(depth_resp, dict):
+                    premium = depth_resp.get('ltp') or depth_resp.get('last_price')
+            except Exception:
+                premium = None
+
+            if premium is None:
+                oc_resp = make_fyers_api_call(fyers_instance.optionchain, data={"symbol": symbol, "strikecount": 1})
+                if isinstance(oc_resp, tuple) and len(oc_resp) == 2 and isinstance(oc_resp[1], int):
+                    return oc_resp
+                found = _find_option_in_chain(oc_resp, option_symbol=symbol)
+                node = found or (oc_resp if isinstance(oc_resp, dict) else None)
+            else:
+                node = depth_resp if isinstance(depth_resp, dict) else None
+
+        else:
+            oc_resp = make_fyers_api_call(fyers_instance.optionchain, data={"symbol": underlying, "strikecount": 50})
+            if isinstance(oc_resp, tuple) and len(oc_resp) == 2 and isinstance(oc_resp[1], int):
+                return oc_resp
+            found = _find_option_in_chain(oc_resp, strike=strike, opt_type=opt_type, expiry_ts=expiry_ts)
+            node = found
+
+        if not node:
+            return jsonify({"error": "Option contract not found in Fyers response.", "symbol": symbol or f"{underlying}:{strike}{opt_type if opt_type else ''}"}), 404
+
+        ltp = node.get('ltp') or node.get('last_price') or node.get('close')
+        oi = node.get('oi') or node.get('open_interest') or node.get('openInterest')
+        iv = node.get('iv') or node.get('implied_volatility') or node.get('impliedVol')
+        change = node.get('change') or node.get('price_change') or node.get('p_change')
+        bid = node.get('bid') or node.get('best_bid')
+        ask = node.get('ask') or node.get('best_ask')
+
+        response = {
+            "symbol": symbol or node.get('symbol'),
+            "ltp": ltp,
+            "premium": ltp,
+            "iv": iv,
+            "oi": oi,
+            "change": change,
+            "bid": bid,
+            "ask": ask,
+            "raw": node
         }
-        
-        history = fyers_manager.make_api_call(
-            fyers_manager.fyers_instance.history,
-            data=history_data
-        )
-        
-        # Generate signals
-        analysis_data = {
-            "symbol": symbol,
-            "current": quotes,
-            "history": history.get("candles", []),
-            "indicators": calculate_indicators(history.get("candles", []))
-        }
-        
-        signals = ai_manager.analyze(analysis_data, "technical")
-        return jsonify(signals)
-        
+        return jsonify(response)
+
     except Exception as e:
-        logger.error(f"Signal generation error: {e}")
+        app.logger.error(f"Error in option_premium endpoint: {e}", exc_info=True)
         return jsonify({"error": str(e)}), 500
 
-# ========================= WebSocket Routes =========================
+@app.route('/api/fyers/option_chain_depth', methods=['GET'])
+def get_option_chain_depth():
+    """Returns detailed market depth for a chosen option contract."""
+    symbol = request.args.get('symbol')
+    underlying = request.args.get('underlying')
+    strike = request.args.get('strike')
+    opt_type = request.args.get('type')
+    expiry_ts = request.args.get('expiry_ts')
 
-@sock.route('/ws/market')
-def market_websocket(ws):
-    """WebSocket endpoint for real-time market data"""
     try:
-        ws_manager.add_client(ws)
-        
-        while True:
-            message = ws.receive()
-            if message is None:
-                break
-            
+        if symbol:
+            depth_resp = make_fyers_api_call(fyers_instance.depth, data={"symbol": symbol, "ohlcv_flag": 1})
+            if isinstance(depth_resp, tuple) and len(depth_resp) == 2 and isinstance(depth_resp[1], int):
+                return depth_resp
+
             try:
-                data = json.loads(message)
-                action = data.get("action")
-                
-                if action == "subscribe":
-                    symbols = data.get("symbols", [])
-                    ws.send(json.dumps({
-                        "status": "subscribed",
-                        "symbols": symbols
-                    }))
-                    
-                elif action == "unsubscribe":
-                    symbols = data.get("symbols", [])
-                    ws.send(json.dumps({
-                        "status": "unsubscribed",
-                        "symbols": symbols
-                    }))
-                    
-                elif action == "ping":
-                    ws.send(json.dumps({"type": "pong"}))
-                    
-            except json.JSONDecodeError:
-                ws.send(json.dumps({"error": "Invalid JSON"}))
-                
+                underlying_guess = symbol.split(":")[0] if ":" in symbol else None
+            except Exception:
+                underlying_guess = None
+
+            oc_resp = None
+            try:
+                if underlying_guess:
+                    oc_resp = make_fyers_api_call(fyers_instance.optionchain, data={"symbol": underlying_guess, "strikecount": 10})
+            except Exception:
+                oc_resp = None
+
+            return jsonify({"depth": depth_resp, "option_chain_context": oc_resp})
+
+        if not (underlying and strike and opt_type):
+            return jsonify({"error": "Provide either symbol=<OPTION_SYMBOL> OR underlying & strike & type parameters."}), 400
+
+        oc_resp = make_fyers_api_call(fyers_instance.optionchain, data={"symbol": underlying, "strikecount": 50})
+        if isinstance(oc_resp, tuple) and len(oc_resp) == 2 and isinstance(oc_resp[1], int):
+            return oc_resp
+
+        found = _find_option_in_chain(oc_resp, strike=strike, opt_type=opt_type, expiry_ts=expiry_ts)
+        if not found:
+            return jsonify({"error": "Option strike not found in option chain response.", "underlying": underlying, "strike": strike, "type": opt_type}), 404
+
+        symbol_to_query = found.get('symbol') or request.args.get('symbol')
+        if not symbol_to_query:
+            return jsonify({"error": "Could not determine option symbol to query depth for."}), 500
+
+        depth_resp = make_fyers_api_call(fyers_instance.depth, data={"symbol": symbol_to_query, "ohlcv_flag": 1})
+        if isinstance(depth_resp, tuple) and len(depth_resp) == 2 and isinstance(depth_resp[1], int):
+            return depth_resp
+
+        return jsonify({"depth": depth_resp, "option_chain_context": oc_resp})
+
     except Exception as e:
-        logger.error(f"WebSocket error: {e}")
-    finally:
-        ws_manager.remove_client(ws)
+        app.logger.error(f"Error in option_chain_depth endpoint: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
 
-# ========================= Health & Status =========================
+@app.route('/api/fyers/news', methods=['GET'])
+def get_news():
+    app.logger.info("Accessing placeholder news endpoint.")
 
-@app.route('/health')
-@limiter.exempt
-def health_check():
-    """Health check endpoint"""
-    status = {
-        "status": "healthy",
-        "timestamp": datetime.datetime.now().isoformat(),
-        "services": {
-            "fyers": fyers_manager.is_initialized(),
-            "ai": ai_manager.is_available(),
-            "websocket": len(ws_manager.clients)
-        }
-    }
-    return jsonify(status)
-
-@app.route('/')
-@limiter.exempt
-def home():
-    """API documentation"""
+    news_headlines = [
+        {"id": 1, "title": "Market sentiments positive on Q1 earnings", "source": "Fyers Internal Analysis", "timestamp": str(datetime.datetime.now())},
+        {"id": 2, "title": "RBI holds interest rates steady", "source": "Economic Times", "timestamp": str(datetime.datetime.now() - datetime.timedelta(hours=2))},
+        {"id": 3, "title": "Tech stocks lead the rally", "source": "Reuters", "timestamp": str(datetime.datetime.now() - datetime.timedelta(days=1))},
+        {"id": 4, "title": "F&O expiry expected to be volatile", "source": "Fyers Blog", "timestamp": str(datetime.datetime.now() - datetime.timedelta(days=1, hours=4))}
+    ]
     return jsonify({
-        "name": "Fyers Trading API Proxy",
-        "version": "2.0.0",
-        "endpoints": {
-            "authentication": {
-                "login": "/api/auth/login",
-                "callback": "/api/auth/callback"
-            },
-            "market_data": {
-                "profile": "/api/market/profile",
-                "funds": "/api/market/funds",
-                "holdings": "/api/market/holdings",
-                "history": "/api/market/history",
-                "quotes": "/api/market/quotes"
-            },
-            "commodities": {
-                "list": "/api/commodities/list",
-                "quotes": "/api/commodities/quotes",
-                "history": "/api/commodities/history",
-                "order": "/api/commodities/order"
-            },
-            "mutual_funds": {
-                "list": "/api/mutual-funds/list",
-                "nav": "/api/mutual-funds/nav",
-                "order": "/api/mutual-funds/order",
-                "sip": "/api/mutual-funds/sip",
-                "performance": "/api/mutual-funds/performance"
-            },
-            "orders": {
-                "place": "/api/orders/place",
-                "modify": "/api/orders/modify",
-                "cancel": "/api/orders/cancel"
-            },
-            "ai": {
-                "analyze": "/api/ai/analyze",
-                "signals": "/api/ai/signals"
-            },
-            "websocket": "/ws/market",
-            "health": "/health"
-        },
-        "features": [
-            "Stocks Trading",
-            "Commodities Trading",
-            "Mutual Funds Investment",
-            "AI-Powered Analysis",
-            "Real-time WebSocket Data",
-            "Rate Limiting",
-            "Caching",
-            "Secure Token Management"
-        ]
+        "message": "This is a placeholder for Fyers news. Actual integration requires a dedicated news API or scraping.",
+        "news": news_headlines
     })
 
-# ========================= Error Handlers =========================
+# --- Order Management APIs ---
 
-@app.errorhandler(404)
-def not_found(error):
-    return jsonify({"error": "Endpoint not found"}), 404
+@app.route('/api/fyers/order', methods=['POST'])
+def place_single_order():
+    order_data = request.json
+    if not order_data:
+        return jsonify({"error": "Order data is required."}), 400
+    result = make_fyers_api_call(fyers_instance.place_order, data=order_data)
+    if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], int):
+        return result
+    return jsonify(result)
 
-@app.errorhandler(429)
-def rate_limit_exceeded(error):
-    return jsonify({"error": "Rate limit exceeded", "message": str(error.description)}), 429
+@app.route('/api/fyers/orders/multi', methods=['POST'])
+def place_multi_order():
+    multi_order_data = request.json
+    if not multi_order_data or not isinstance(multi_order_data, list):
+        return jsonify({"error": "An array of order objects is required for multi-order placement."}), 400
 
-@app.errorhandler(500)
-def internal_error(error):
-    logger.error(f"Internal server error: {error}")
-    return jsonify({"error": "Internal server error"}), 500
+    result = make_fyers_api_call(fyers_instance.multi_order, data=multi_order_data)
+    if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], int):
+        return result
+    return jsonify(result)
 
-# ========================= Main =========================
+@app.route('/api/fyers/orders/multileg', methods=['POST'])
+def place_multileg_order():
+    multileg_data = request.json
+    if not multileg_data:
+        return jsonify({"error": "Multileg order data is required."}), 400
+    result = make_fyers_api_call(fyers_instance.multileg_order, data=multileg_data)
+    if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], int):
+        return result
+    return jsonify(result)
+
+@app.route('/api/fyers/gtt/order', methods=['POST'])
+def place_gtt_order():
+    gtt_order_data = request.json
+    if not gtt_order_data:
+        return jsonify({"error": "GTT order data is required."}), 400
+    result = make_fyers_api_call(fyers_instance.place_gttorder, data=gtt_order_data)
+    if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], int):
+        return result
+    return jsonify(result)
+
+@app.route('/api/fyers/gtt/order', methods=['PATCH'])
+def modify_gtt_order():
+    gtt_modify_data = request.json
+    if not gtt_modify_data or not gtt_modify_data.get("id"):
+        return jsonify({"error": "GTT order ID and modification data are required."}), 400
+
+    order_id = gtt_modify_data.pop("id")
+    result = make_fyers_api_call(fyers_instance.modify_gttorder, id=order_id, data=gtt_modify_data)
+    if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], int):
+        return result
+    return jsonify(result)
+
+@app.route('/api/fyers/gtt/order', methods=['DELETE'])
+def cancel_gtt_order():
+    gtt_cancel_data = request.json
+    if not gtt_cancel_data or not gtt_cancel_data.get("id"):
+        return jsonify({"error": "GTT order ID is required for cancellation."}), 400
+
+    order_id = gtt_cancel_data.get("id")
+    result = make_fyers_api_call(fyers_instance.cancel_gttorder, id=order_id)
+    if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], int):
+        return result
+    return jsonify(result)
+
+@app.route('/api/fyers/gtt/orders', methods=['GET'])
+def get_gtt_orders():
+    result = make_fyers_api_call(fyers_instance.gtt_orders)
+    if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], int):
+        return result
+    return jsonify(result)
+
+@app.route('/api/fyers/order', methods=['PATCH'])
+def modify_single_order():
+    modify_data = request.json
+    if not modify_data or not modify_data.get("id"):
+        return jsonify({"error": "Order ID and modification data are required."}), 400
+
+    result = make_fyers_api_call(fyers_instance.modify_order, data=modify_data)
+    if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], int):
+        return result
+    return jsonify(result)
+
+@app.route('/api/fyers/orders/multi', methods=['PATCH'])
+def modify_multi_orders():
+    modify_basket_data = request.json
+    if not modify_basket_data or not isinstance(modify_basket_data, list):
+        return jsonify({"error": "An array of order modification objects is required."}), 400
+
+    result = make_fyers_api_call(fyers_instance.modify_basket_orders, data=modify_basket_data)
+    if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], int):
+        return result
+    return jsonify(result)
+
+@app.route('/api/fyers/order', methods=['DELETE'])
+def cancel_single_order():
+    cancel_data = request.json
+    if not cancel_data or not cancel_data.get("id"):
+        return jsonify({"error": "Order ID is required for cancellation."}), 400
+
+    result = make_fyers_api_call(fyers_instance.cancel_order, data=cancel_data)
+    if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], int):
+        return result
+    return jsonify(result)
+
+@app.route('/api/fyers/orders/multi', methods=['DELETE'])
+def cancel_multi_orders():
+    cancel_basket_data = request.json
+    if not cancel_basket_data or not isinstance(cancel_basket_data, list):
+        return jsonify({"error": "An array of order cancellation objects (with 'id') is required."}), 400
+
+    result = make_fyers_api_call(fyers_instance.cancel_basket_orders, data=cancel_basket_data)
+    if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], int):
+        return result
+    return jsonify(result)
+
+@app.route('/api/fyers/positions', methods=['DELETE'])
+def exit_positions():
+    exit_data = request.json
+    if not exit_data:
+        return jsonify({"error": "Request body for exiting positions is required."}), 400
+
+    result = make_fyers_api_call(fyers_instance.exit_positions, data=exit_data)
+    if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], int):
+        return result
+    return jsonify(result)
+
+@app.route('/api/fyers/positions', methods=['POST'])
+def convert_position():
+    convert_data = request.json
+    if not convert_data:
+        return jsonify({"error": "Position conversion data is required."}), 400
+
+    result = make_fyers_api_call(fyers_instance.convert_positions, data=convert_data)
+    if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], int):
+        return result
+    return jsonify(result)
+
+# --- Margin Calculator APIs ---
+
+@app.route('/api/fyers/margin/span', methods=['POST'])
+def span_margin_calculator():
+    margin_data = request.json
+    if not margin_data or not margin_data.get("data"):
+        return jsonify({"error": "An array of order details for span margin calculation is required under 'data' key."}), 400
+
+    result = make_fyers_api_call(fyers_instance.span_margin, data=margin_data)
+    if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], int):
+        return result
+    return jsonify(result)
+
+@app.route('/api/fyers/margin/multiorder', methods=['POST'])
+def multiorder_margin_calculator():
+    margin_data = request.json
+    if not margin_data or not margin_data.get("data"):
+        return jsonify({"error": "An array of order details for multiorder margin calculation is required under 'data' key."}), 400
+
+    result = make_fyers_api_call(fyers_instance.multiorder_margin, data=margin_data)
+    if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], int):
+        return result
+    return jsonify(result)
+
+@app.route('/api/fyers/market_status', methods=['GET'])
+def get_market_status():
+    result = make_fyers_api_call(fyers_instance.market_status)
+    if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], int):
+        return result
+    return jsonify(result)
+
+# --- WebSocket Integration Section ---
+
+_fyers_data_socket = None
+_fyers_socket_thread = None
+_connected_clients = []
+_subscribed_symbols = set()
+_socket_lock = threading.Lock()
+_socket_running = False
+
+def _create_data_socket(access_token, lite_mode=False, write_to_file=False, reconnect=True, reconnect_retry=10):
+    """Create a FyersDataSocket instance with callbacks wired to broadcast incoming messages."""
+    global _fyers_data_socket
+
+    def _on_connect():
+        app.logger.info("Fyers DataSocket connected.")
+        if _subscribed_symbols:
+            try:
+                _fyers_data_socket.subscribe(symbols=list(_subscribed_symbols), data_type="SymbolUpdate")
+                app.logger.info(f"Re-subscribed to symbols on connect: {_subscribed_symbols}")
+            except Exception as e:
+                app.logger.error(f"Error re-subscribing on connect: {e}", exc_info=True)
+
+    def _on_message(message):
+        """Called for incoming socket messages from Fyers. Broadcast to all connected clients."""
+        try:
+            if isinstance(message, str):
+                payload = message
+            else:
+                payload = json.dumps(message, default=str)
+        except Exception:
+            payload = str(message)
+
+        with _socket_lock:
+            to_remove = []
+            for client in _connected_clients:
+                try:
+                    client.send(payload)
+                except Exception as e:
+                    app.logger.debug(f"Failed to send to one client: {e}")
+                    to_remove.append(client)
+            for r in to_remove:
+                try:
+                    _connected_clients.remove(r)
+                except ValueError:
+                    pass
+
+    def _on_error(error):
+        app.logger.error(f"Fyers DataSocket error: {error}")
+
+    def _on_close(close_msg):
+        app.logger.info(f"Fyers DataSocket closed: {close_msg}")
+
+    try:
+        _fyers_data_socket = data_ws.FyersDataSocket(
+            access_token=access_token,
+            log_path="",
+            litemode=lite_mode,
+            write_to_file=write_to_file,
+            reconnect=reconnect,
+            on_connect=_on_connect,
+            on_close=_on_close,
+            on_error=_on_error,
+            on_message=_on_message,
+            reconnect_retry=reconnect_retry
+        )
+        return _fyers_data_socket
+    except Exception as e:
+        app.logger.error(f"Failed to create FyersDataSocket: {e}", exc_info=True)
+        return None
+
+def _start_data_socket_in_thread(access_token):
+    """Starts the Fyers DataSocket in a dedicated daemon thread if not already running."""
+    global _fyers_socket_thread, _socket_running, _fyers_data_socket
+
+    with _socket_lock:
+        if _socket_running:
+            app.logger.info("Fyers DataSocket already running; skip start.")
+            return True
+
+        _fyers_data_socket = _create_data_socket(access_token)
+        if not _fyers_data_socket:
+            app.logger.error("Could not create FyersDataSocket instance.")
+            return False
+
+        def _run():
+            global _socket_running
+            try:
+                _socket_running = True
+                app.logger.info("Starting Fyers DataSocket.connect() (blocking call in thread).")
+                _fyers_data_socket.connect()
+            except Exception as e:
+                app.logger.error(f"Fyers DataSocket thread crashed: {e}", exc_info=True)
+            finally:
+                _socket_running = False
+                app.logger.info("Fyers DataSocket thread stopped.")
+
+        _fyers_socket_thread = threading.Thread(target=_run, daemon=True, name="FyersDataSocketThread")
+        _fyers_socket_thread.start()
+        app.logger.info("Fyers DataSocket thread started.")
+        return True
+
+def _ensure_data_socket_running():
+    """Ensures the socket is running; if not, try to start it with current ACCESS_TOKEN."""
+    global ACCESS_TOKEN
+    if not ACCESS_TOKEN:
+        app.logger.warning("ACCESS_TOKEN is not available; cannot start data socket.")
+        return False
+    return _start_data_socket_in_thread(ACCESS_TOKEN)
+
+@sock.route('/ws/fyers')
+def ws_fyers(ws):
+    """
+    Frontend connects here: wss://<host>/ws/fyers
+    Supported incoming JSON messages from frontend:
+      - {"action": "subscribe", "symbols": ["NSE:SBIN-EQ","NSE:TCS-EQ"], "data_type":"SymbolUpdate"}
+      - {"action": "unsubscribe", "symbols": ["NSE:SBIN-EQ"]}
+      - {"action": "mode", "lite": true}
+      - {"action": "status"}
+    """
+    global _connected_clients, _subscribed_symbols, _fyers_data_socket, ACCESS_TOKEN
+
+    with _socket_lock:
+        _connected_clients.append(ws)
+    app.logger.info(f"Frontend websocket connected. Total clients: {len(_connected_clients)}")
+
+    try:
+        if not _socket_running:
+            started = _ensure_data_socket_running()
+            if not started:
+                err = {"error": "Fyers DataSocket could not be started. Ensure ACCESS_TOKEN is set and valid."}
+                try:
+                    ws.send(json.dumps(err))
+                except Exception:
+                    pass
+                ws.close()
+                return
+
+        while True:
+            msg = ws.receive()
+            if msg is None:
+                app.logger.info("Frontend websocket disconnected (receive returned None).")
+                break
+
+            try:
+                data = json.loads(msg)
+            except Exception:
+                try:
+                    ws.send(json.dumps({"error":"Invalid JSON command"}))
+                except Exception:
+                    pass
+                continue
+
+            action = data.get("action")
+            if action == "subscribe":
+                symbols = data.get("symbols", [])
+                data_type = data.get("data_type", "SymbolUpdate")
+                if not symbols:
+                    try:
+                        ws.send(json.dumps({"error":"No symbols provided for subscribe"}))
+                    except Exception:
+                        pass
+                    continue
+
+                with _socket_lock:
+                    for s in symbols:
+                        _subscribed_symbols.add(s)
+
+                try:
+                    if _fyers_data_socket:
+                        try:
+                            _fyers_data_socket.subscribe(symbols=symbols, data_type=data_type)
+                        except TypeError:
+                            _fyers_data_socket.subscribe(symbols)
+                        try:
+                            ws.send(json.dumps({"status":"subscribed", "symbols": symbols}))
+                        except Exception:
+                            pass
+                    else:
+                        ws.send(json.dumps({"error":"Internal server: data socket not available"}))
+                except Exception as e:
+                    app.logger.error(f"Error subscribing via fyers socket: {e}", exc_info=True)
+                    try:
+                        ws.send(json.dumps({"error":str(e)}))
+                    except Exception:
+                        pass
+
+            elif action == "unsubscribe":
+                symbols = data.get("symbols", [])
+                data_type = data.get("data_type", "SymbolUpdate")
+                if not symbols:
+                    try:
+                        ws.send(json.dumps({"error":"No symbols provided for unsubscribe"}))
+                    except Exception:
+                        pass
+                    continue
+
+                with _socket_lock:
+                    for s in symbols:
+                        _subscribed_symbols.discard(s)
+
+                try:
+                    if _fyers_data_socket:
+                        try:
+                            _fyers_data_socket.unsubscribe(symbols=symbols, data_type=data_type)
+                        except TypeError:
+                            _fyers_data_socket.unsubscribe(symbols)
+                        try:
+                            ws.send(json.dumps({"status":"unsubscribed", "symbols": symbols}))
+                        except Exception:
+                            pass
+                    else:
+                        ws.send(json.dumps({"error":"Internal server: data socket not available"}))
+                except Exception as e:
+                    app.logger.error(f"Error unsubscribing via fyers socket: {e}", exc_info=True)
+                    try:
+                        ws.send(json.dumps({"error":str(e)}))
+                    except Exception:
+                        pass
+
+            elif action == "mode":
+                lite = data.get("lite", False)
+                try:
+                    with _socket_lock:
+                        current_symbols = list(_subscribed_symbols)
+                        try:
+                            if _fyers_data_socket:
+                                try:
+                                    _fyers_data_socket.close()
+                                except Exception:
+                                    try:
+                                        _fyers_data_socket.stop()
+                                    except Exception:
+                                        pass
+                        except Exception:
+                            pass
+
+                        _create_data_socket(access_token=ACCESS_TOKEN, lite_mode=bool(lite))
+                        if not _socket_running:
+                            _start_data_socket_in_thread(ACCESS_TOKEN)
+
+                        if current_symbols and _fyers_data_socket:
+                            try:
+                                _fyers_data_socket.subscribe(symbols=current_symbols, data_type="SymbolUpdate")
+                            except Exception:
+                                try:
+                                    _fyers_data_socket.subscribe(current_symbols)
+                                except Exception:
+                                    app.logger.debug("Failed to re-subscribe after mode switch.")
+                    ws.send(json.dumps({"status":"mode_changed", "lite": bool(lite)}))
+                except Exception as e:
+                    app.logger.error(f"Error switching mode: {e}", exc_info=True)
+                    try:
+                        ws.send(json.dumps({"error":str(e)}))
+                    except Exception:
+                        pass
+
+            elif action == "status":
+                try:
+                    status = {
+                        "socket_running": bool(_socket_running),
+                        "connected_clients": len(_connected_clients),
+                        "subscribed_symbols": list(_subscribed_symbols)
+                    }
+                    ws.send(json.dumps({"status": status}))
+                except Exception:
+                    pass
+
+            else:
+                try:
+                    ws.send(json.dumps({
+                        "error":"Unknown action",
+                        "usage": [
+                            {"action":"subscribe", "symbols":["NSE:SBIN-EQ"], "data_type":"SymbolUpdate"},
+                            {"action":"unsubscribe", "symbols":["NSE:SBIN-EQ"]},
+                            {"action":"mode", "lite": True},
+                            {"action":"status"}
+                        ]
+                    }))
+                except Exception:
+                    pass
+
+    except Exception as e:
+        app.logger.error(f"Error in ws_fyers handling: {e}", exc_info=True)
+    finally:
+        with _socket_lock:
+            try:
+                _connected_clients.remove(ws)
+            except ValueError:
+                pass
+        app.logger.info(f"Frontend websocket disconnected. Remaining clients: {len(_connected_clients)}")
+
+# --- Main Routes ---
+
+@app.route('/')
+def home():
+    return jsonify({
+        "message": "Fyers API Proxy Server with AI Integration is running!",
+        "endpoints": {
+            "authentication": "/fyers-login",
+            "historical_data": "/api/fyers/history",
+            "ai_endpoints": {
+                "analyze": "/api/ai/analyze",
+                "trading_signals": "/api/ai/trading-signals",
+                "chat": "/api/ai/chat",
+                "portfolio_analysis": "/api/ai/portfolio-analysis",
+                "market_summary": "/api/ai/market-summary"
+            },
+            "supported_resolutions": {
+                "second": SECOND_RESOLUTIONS,
+                "minute": MINUTE_RESOLUTIONS,
+                "day": DAY_RESOLUTIONS
+            },
+            "ai_status": "enabled" if gemini_model else "disabled (set GEMINI_API_KEY)"
+        }
+    })
+
+# Register the backtesting blueprint
+app.register_blueprint(backtesting_bp)
 
 if __name__ == '__main__':
-    # Initialize services
-    if token_manager.get_token("fyers_access"):
-        fyers_manager.initialize()
-    
-    # Run app (use gunicorn or uwsgi in production)
-    app.run(
-        host='0.0.0.0',
-        port=int(os.environ.get('PORT', 5000)),
-        debug=False  # Never use debug=True in production
-    )
+    # Start the Fyers data socket at startup if an access token is present
+    if ACCESS_TOKEN:
+        try:
+            _start_data_socket_in_thread(ACCESS_TOKEN)
+        except Exception as e:
+            app.logger.warning(f"Could not start Fyers DataSocket at startup: {e}")
+
+    app.run(host='0.0.0.0', port=5000, debug=True)
