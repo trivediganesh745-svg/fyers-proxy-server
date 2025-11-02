@@ -90,6 +90,8 @@ if not all([CLIENT_ID, SECRET_KEY, REDIRECT_URI]):
 # Initialize FyersModel
 fyers_instance = None 
 
+
+
 # --- AI Analysis Functions ---
 
 def analyze_market_data_with_ai(data: Dict[str, Any], analysis_type: str = "general") -> Dict[str, Any]:
@@ -285,28 +287,58 @@ def calculate_advanced_indicators(candles: List) -> Dict[str, Any]:
 # --- Storage and Token Management ---
 
 def store_tokens(access_token, refresh_token):
+    """Store tokens in memory and provide instructions for persistence"""
     global ACCESS_TOKEN, REFRESH_TOKEN
     ACCESS_TOKEN = access_token
     REFRESH_TOKEN = refresh_token
 
-    app.logger.info("Tokens updated. For persistence, save these securely:")
+    app.logger.info("Tokens updated successfully!")
+    
+    # For Render deployment, you need to manually update environment variables
+    # or use a database/file storage solution
+    app.logger.info("IMPORTANT: For persistence on Render, update these environment variables:")
+    app.logger.info(f"FYERS_ACCESS_TOKEN={ACCESS_TOKEN}")
+    app.logger.info(f"FYERS_REFRESH_TOKEN={REFRESH_TOKEN}")
+    
+    # Save to a local file as backup (optional for Render persistent disk)
     try:
-        app.logger.info(f"New Access Token: {ACCESS_TOKEN[:10]}...")
-    except Exception:
-        app.logger.info("New Access Token: (hidden)")
-    try:
-        app.logger.info(f"New Refresh Token: {REFRESH_TOKEN[:10]}...")
-    except Exception:
-        app.logger.info("New Refresh Token: (hidden)")
+        token_data = {
+            "access_token": ACCESS_TOKEN,
+            "refresh_token": REFRESH_TOKEN,
+            "updated_at": datetime.datetime.now().isoformat()
+        }
+        with open("tokens.json", "w") as f:
+            json.dump(token_data, f)
+        app.logger.info("Tokens saved to tokens.json file")
+    except Exception as e:
+        app.logger.error(f"Could not save tokens to file: {e}")
 
 def load_tokens():
+    """Load tokens from environment or file"""
     global ACCESS_TOKEN, REFRESH_TOKEN
-    pass
+    
+    # First try environment variables
+    if os.environ.get("FYERS_ACCESS_TOKEN"):
+        ACCESS_TOKEN = os.environ.get("FYERS_ACCESS_TOKEN")
+        REFRESH_TOKEN = os.environ.get("FYERS_REFRESH_TOKEN")
+        app.logger.info("Tokens loaded from environment variables")
+        return
+    
+    # Try loading from file as fallback
+    try:
+        with open("tokens.json", "r") as f:
+            token_data = json.load(f)
+            ACCESS_TOKEN = token_data.get("access_token")
+            REFRESH_TOKEN = token_data.get("refresh_token")
+            app.logger.info(f"Tokens loaded from file (updated: {token_data.get('updated_at')})")
+    except Exception as e:
+        app.logger.info(f"No tokens file found or error loading: {e}")
 
 # Load tokens at startup
 load_tokens()
 
 def initialize_fyers_model(token=None):
+    """Initialize Fyers model with token or refresh token"""
     global fyers_instance, ACCESS_TOKEN, REFRESH_TOKEN
 
     token_to_use = token if token else ACCESS_TOKEN
@@ -321,6 +353,10 @@ def initialize_fyers_model(token=None):
             return True
         except Exception as e:
             app.logger.error(f"Failed to initialize fyers_model with provided token: {e}", exc_info=True)
+            # Try refreshing if we have a refresh token
+            if REFRESH_TOKEN:
+                app.logger.info("Access token failed, attempting refresh...")
+                return refresh_access_token()
             return False
     elif REFRESH_TOKEN and CLIENT_ID and SECRET_KEY:
         app.logger.info("No access token provided or found, attempting to use refresh token.")
@@ -335,9 +371,15 @@ def initialize_fyers_model(token=None):
         return False
 
 def refresh_access_token():
-    global ACCESS_TOKEN, REFRESH_TOKEN
+    """Refresh the access token using refresh token"""
+    global ACCESS_TOKEN, REFRESH_TOKEN, fyers_instance
+    
     if not REFRESH_TOKEN:
         app.logger.error("Cannot refresh token: No refresh token available.")
+        return False
+
+    if not all([CLIENT_ID, SECRET_KEY, REDIRECT_URI]):
+        app.logger.error("Cannot refresh token: Missing CLIENT_ID, SECRET_KEY, or REDIRECT_URI")
         return False
 
     session = fyersModel.SessionModel(
@@ -351,7 +393,7 @@ def refresh_access_token():
     session.set_token(REFRESH_TOKEN)
 
     try:
-        app.logger.info(f"Attempting to refresh access token using refresh token: {REFRESH_TOKEN[:5]}...")
+        app.logger.info(f"Attempting to refresh access token...")
         response = session.generate_token()
 
         if response and response.get("s") == "ok":
@@ -359,18 +401,74 @@ def refresh_access_token():
             new_refresh_token = response.get("refresh_token", REFRESH_TOKEN)
 
             store_tokens(new_access_token, new_refresh_token)
-            initialize_fyers_model(new_access_token)
-            app.logger.info("Access token refreshed successfully.")
-            return True
+            
+            # Re-initialize Fyers model with new token
+            try:
+                fyers_instance = fyersModel.FyersModel(
+                    access_token=new_access_token, 
+                    is_async=False, 
+                    client_id=CLIENT_ID, 
+                    log_path=""
+                )
+                app.logger.info("Access token refreshed and FyersModel reinitialized successfully.")
+                return True
+            except Exception as e:
+                app.logger.error(f"Failed to reinitialize FyersModel after refresh: {e}")
+                return False
         else:
             app.logger.error(f"Failed to refresh access token. Response: {response}")
             return False
     except Exception as e:
         app.logger.error(f"Error during access token refresh: {e}", exc_info=True)
         return False
-
-# Initialize Fyers model at startup
+# Initialize Fyers model at startup - will try refresh token if access token fails
 initialize_fyers_model()
+
+# --- Helper function to wrap Fyers API calls with automatic refresh logic ---
+def make_fyers_api_call(api_method, *args, **kwargs):
+    """Make Fyers API call with automatic token refresh on failure"""
+    global fyers_instance
+    
+    if not fyers_instance:
+        app.logger.warning("Fyers API not initialized. Attempting to initialize.")
+        if not initialize_fyers_model():
+            return {"error": "Fyers API not initialized. Please authenticate first."}, 401
+
+    try:
+        # First attempt
+        result = api_method(*args, **kwargs)
+        
+        # Check if result indicates token error
+        if isinstance(result, dict):
+            error_code = result.get("code") or result.get("s")
+            error_message = str(result.get("message", "")).lower()
+            
+            if (error_code in [-16, -99, 401, "error"] or 
+                any(keyword in error_message for keyword in ["token", "expired", "invalid", "authenticate", "authorization"])):
+                raise Exception("Token expired or invalid")
+        
+        return result
+        
+    except Exception as e:
+        error_message = str(e).lower()
+
+        if any(keyword in error_message for keyword in ["token", "expired", "invalid", "authenticate", "authorization"]):
+            app.logger.warning(f"Token issue detected. Attempting to refresh. Error: {e}")
+            
+            if refresh_access_token():
+                app.logger.info("Token refreshed, retrying original request.")
+                try:
+                    # Retry the API call with refreshed token
+                    return api_method(*args, **kwargs)
+                except Exception as retry_error:
+                    app.logger.error(f"Request failed even after token refresh: {retry_error}")
+                    return {"error": f"Request failed after token refresh: {str(retry_error)}"}, 500
+            else:
+                app.logger.error("Token refresh failed. User needs to re-authenticate.")
+                return {"error": "Authentication expired. Please login again via /fyers-login"}, 401
+        else:
+            app.logger.error(f"Non-token related Fyers API error: {e}", exc_info=True)
+            return {"error": f"Fyers API error: {str(e)}"}, 500
 
 # --- Gemini AI Endpoints ---
 
@@ -647,7 +745,7 @@ def make_fyers_api_call(api_method, *args, **kwargs):
             app.logger.error(f"Non-token related Fyers API error: {e}", exc_info=True)
             return jsonify({"error": f"Fyers API error: {str(e)}"}), 500
 
-# --- Fyers Authentication Flow Endpoints ---
+# --- Fyers Authentication Flow Endpoints (FIXED) ---
 
 @app.route('/fyers-login')
 def fyers_login():
@@ -691,6 +789,7 @@ def fyers_auth_callback():
         grant_type="authorization_code"
     )
     session.set_token(auth_code)
+    
     try:
         response = session.generate_token()
 
@@ -699,10 +798,32 @@ def fyers_auth_callback():
             new_refresh_token = response["refresh_token"]
 
             store_tokens(new_access_token, new_refresh_token)
-            initialize_fyers_model(new_access_token)
-
-            app.logger.info("Fyers tokens generated successfully!")
-            return jsonify({"message": "Fyers tokens generated successfully!", "access_token_available": True})
+            
+            # Initialize Fyers model with new token
+            if initialize_fyers_model(new_access_token):
+                app.logger.info("Authentication successful!")
+                
+                # Return success page with instructions
+                return f"""
+                <html>
+                <head><title>Authentication Successful</title></head>
+                <body style="font-family: Arial; padding: 20px;">
+                    <h2>✅ Fyers Authentication Successful!</h2>
+                    <p>Your tokens have been generated and saved.</p>
+                    <h3>Important for Render Deployment:</h3>
+                    <p>Update these environment variables in your Render dashboard:</p>
+                    <pre style="background: #f0f0f0; padding: 10px;">
+FYERS_ACCESS_TOKEN={new_access_token}
+FYERS_REFRESH_TOKEN={new_refresh_token}
+                    </pre>
+                    <p>The refresh token will be used automatically to maintain access.</p>
+                    <br>
+                    <p>You can now close this window and return to your application.</p>
+                </body>
+                </html>
+                """
+            else:
+                return jsonify({"error": "Failed to initialize Fyers model with new tokens"}), 500
         else:
             app.logger.error(f"Failed to generate Fyers tokens. Response: {response}")
             return jsonify({"error": f"Failed to generate Fyers tokens. Response: {response}"}), 500
@@ -712,7 +833,34 @@ def fyers_auth_callback():
         return jsonify({"error": f"Failed to generate Fyers access token: {str(e)}"}), 500
 
 # --- Fyers Data Endpoints ---
-
+# --- Check Authentication Status Endpoint ---
+@app.route('/api/auth/status')
+def auth_status():
+    """Check current authentication status"""
+    global ACCESS_TOKEN, REFRESH_TOKEN, fyers_instance
+    
+    has_access = bool(ACCESS_TOKEN)
+    has_refresh = bool(REFRESH_TOKEN)
+    fyers_initialized = bool(fyers_instance)
+    
+    # Try a simple API call to verify token validity
+    token_valid = False
+    if fyers_instance:
+        try:
+            result = fyers_instance.get_profile()
+            if result and result.get("s") == "ok":
+                token_valid = True
+        except:
+            pass
+    
+    return jsonify({
+        "authenticated": token_valid,
+        "has_access_token": has_access,
+        "has_refresh_token": has_refresh,
+        "fyers_initialized": fyers_initialized,
+        "message": "Authenticated and ready" if token_valid else "Authentication required"
+    })
+    
 @app.route('/api/fyers/profile')
 def get_profile():
     result = make_fyers_api_call(fyers_instance.get_profile)
