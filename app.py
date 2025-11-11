@@ -21,19 +21,32 @@ import numpy as np
 # Load environment variables from .env file (for local development)
 load_dotenv()
 
+# Initialize Flask app FIRST
 app = Flask(__name__)
 
-# --- STEP 2: CONFIGURE CORS USING THE 'app' OBJECT ---
-# This block now correctly comes AFTER app is defined.
+# Get allowed origins from environment
 allowed_origins_str = os.environ.get("ALLOWED_ORIGINS", "")
-if allowed_origins_str:
-    allowed_origins = [origin.strip() for origin in allowed_origins_str.split(',') if origin.strip()]
-    print(f"CORS is configured to allow requests from: {allowed_origins}")
-    CORS(app, origins=allowed_origins, supports_credentials=True)
+allowed_origins = [origin.strip() for origin in allowed_origins_str.split(',') if origin.strip()]
+
+# For development/debugging - allow all origins if none specified
+if not allowed_origins:
+    allowed_origins = ["*"]
+    print("⚠️ WARNING: No ALLOWED_ORIGINS set. Allowing all origins (INSECURE!)")
 else:
-    # This fallback is for safety, but in Render you should always have the variable set.
-    print("WARNING: ALLOWED_ORIGINS environment variable not set. CORS might not be configured correctly for your deployed frontend.")
-    CORS(app, supports_credentials=True) # A fallback that is still secure
+    print(f"✅ CORS configured for origins: {allowed_origins}")
+
+# Configure CORS
+CORS(app, 
+     resources={
+         r"/*": {
+             "origins": allowed_origins,
+             "methods": ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+             "allow_headers": ["Content-Type", "Authorization", "X-Requested-With"],
+             "expose_headers": ["Content-Type"],
+             "supports_credentials": True,
+             "max_age": 3600
+         }
+     })
 
 # Initialize Sock for client-facing websocket connections
 sock = Sock(app)
@@ -41,6 +54,63 @@ sock = Sock(app)
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 app.logger.setLevel(logging.INFO)
+
+# Add request logging
+@app.before_request
+def log_request_info():
+    app.logger.info(f'Request: {request.method} {request.url}')
+    app.logger.info(f'Headers: {dict(request.headers)}')
+    app.logger.info(f'Origin: {request.headers.get("Origin", "No Origin")}')
+
+# Handle OPTIONS requests explicitly
+@app.before_request
+def handle_options():
+    if request.method == "OPTIONS":
+        response = make_response("", 204)
+        origin = request.headers.get('Origin')
+        
+        # Check if origin is allowed
+        if origin:
+            if "*" in allowed_origins or origin in allowed_origins:
+                response.headers['Access-Control-Allow-Origin'] = origin
+            else:
+                response.headers['Access-Control-Allow-Origin'] = allowed_origins[0] if allowed_origins else "*"
+        
+        response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, PATCH, DELETE, OPTIONS'
+        response.headers['Access-Control-Allow-Headers'] = request.headers.get('Access-Control-Request-Headers', 'Content-Type, Authorization')
+        response.headers['Access-Control-Allow-Credentials'] = 'true'
+        response.headers['Access-Control-Max-Age'] = '3600'
+        
+        return response
+
+# Add CORS headers to all responses
+@app.after_request
+def after_request(response):
+    origin = request.headers.get('Origin')
+    
+    if origin:
+        if "*" in allowed_origins or origin in allowed_origins:
+            response.headers['Access-Control-Allow-Origin'] = origin
+            response.headers['Access-Control-Allow-Credentials'] = 'true'
+        elif allowed_origins:
+            response.headers['Access-Control-Allow-Origin'] = allowed_origins[0]
+    
+    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, PATCH, DELETE, OPTIONS'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, X-Requested-With'
+    
+    app.logger.info(f'Response Status: {response.status}')
+    app.logger.info(f'Response Headers: {dict(response.headers)}')
+    
+    return response
+
+# Health check endpoint
+@app.route('/health', methods=['GET'])
+def health_check():
+    return jsonify({
+        "status": "healthy",
+        "timestamp": datetime.datetime.now().isoformat(),
+        "service": "Fyers Proxy Server"
+    }), 200
 
 # --- Fyers API Configuration (from environment variables) ---
 CLIENT_ID = os.environ.get("FYERS_CLIENT_ID")
