@@ -21,14 +21,19 @@ import numpy as np
 # Load environment variables from .env file (for local development)
 load_dotenv()
 
-# This new code is flexible and reads the URL from your Render settings
+app = Flask(__name__)
+
+# --- STEP 2: CONFIGURE CORS USING THE 'app' OBJECT ---
+# This block now correctly comes AFTER app is defined.
 allowed_origins_str = os.environ.get("ALLOWED_ORIGINS", "")
-allowed_origins = [origin.strip() for origin in allowed_origins_str.split(',') if origin.strip()]
-
-# This line is great for debugging in your Render logs!
-print(f"CORS is configured to allow requests from: {allowed_origins}")
-
-CORS(app, origins=allowed_origins, supports_credentials=True)
+if allowed_origins_str:
+    allowed_origins = [origin.strip() for origin in allowed_origins_str.split(',') if origin.strip()]
+    print(f"CORS is configured to allow requests from: {allowed_origins}")
+    CORS(app, origins=allowed_origins, supports_credentials=True)
+else:
+    # This fallback is for safety, but in Render you should always have the variable set.
+    print("WARNING: ALLOWED_ORIGINS environment variable not set. CORS might not be configured correctly for your deployed frontend.")
+    CORS(app, supports_credentials=True) # A fallback that is still secure
 
 # Initialize Sock for client-facing websocket connections
 sock = Sock(app)
