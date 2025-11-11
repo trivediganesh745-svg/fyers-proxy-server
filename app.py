@@ -22,7 +22,7 @@ import numpy as np
 load_dotenv()
 
 app = Flask(__name__)
-CORS(app, origins="https://0z2q5khotii1w25ubjwi14zdz4xts62zx0m5iydf8jx2se3u4y-h827969114.scf.usercontent.goog", supports_credentials=True)  # Enable CORS for all routes
+CORS(app, origins=allowed_origins, supports_credentials=True)  # Enable CORS for all routes
 
 # Initialize Sock for client-facing websocket connections
 sock = Sock(app)
