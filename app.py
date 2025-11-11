@@ -21,8 +21,14 @@ import numpy as np
 # Load environment variables from .env file (for local development)
 load_dotenv()
 
-app = Flask(__name__)
-CORS(app, origins=allowed_origins, supports_credentials=True)  # Enable CORS for all routes
+# This new code is flexible and reads the URL from your Render settings
+allowed_origins_str = os.environ.get("ALLOWED_ORIGINS", "")
+allowed_origins = [origin.strip() for origin in allowed_origins_str.split(',') if origin.strip()]
+
+# This line is great for debugging in your Render logs!
+print(f"CORS is configured to allow requests from: {allowed_origins}")
+
+CORS(app, origins=allowed_origins, supports_credentials=True)
 
 # Initialize Sock for client-facing websocket connections
 sock = Sock(app)
