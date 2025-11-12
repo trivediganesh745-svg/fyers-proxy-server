@@ -10,9 +10,35 @@ logger = logging.getLogger(__name__)
 
 fyers_bp = Blueprint('fyers', __name__)
 
+def get_base_url():
+    """
+    Dynamically determine base URL depending on environment.
+    Falls back to Render URL if available, otherwise request.host_url or config setting.
+    """
+    # 1️⃣ Use config variable if explicitly set
+    if hasattr(config, "FYERS_PROXY_BASE_URL") and config.FYERS_PROXY_BASE_URL:
+        return config.FYERS_PROXY_BASE_URL.rstrip("/")
+
+    # 2️⃣ If running on Render, detect public Render URL
+    render_external_url = os.environ.get("RENDER_EXTERNAL_URL")
+    if render_external_url:
+        return render_external_url.rstrip("/")
+
+    # 3️⃣ Try request.host_url (auto-detect)
+    if request and request.host_url:
+        return request.host_url.rstrip("/")
+
+    # 4️⃣ Fallback to localhost only if nothing else
+    return "http://localhost:5000"
+
+
 @fyers_bp.route('/fyers-login')
 def fyers_login():
     """Initiates the Fyers authentication flow."""
+    import os
+
+    base_url = get_base_url()
+
     if not all([config.CLIENT_ID, config.REDIRECT_URI, config.SECRET_KEY]):
         logger.error("Fyers API credentials not fully configured for login.")
         return jsonify({
@@ -22,9 +48,15 @@ def fyers_login():
         }), 500
 
     try:
+        # Fix redirect_uri dynamically if it’s localhost (common issue)
+        redirect_uri = config.REDIRECT_URI
+        if "localhost" in redirect_uri:
+            redirect_uri = f"{base_url}/fyers-auth-callback"
+            logger.info(f"Redirect URI updated for Render: {redirect_uri}")
+
         session = fyersModel.SessionModel(
             client_id=config.CLIENT_ID,
-            redirect_uri=config.REDIRECT_URI,
+            redirect_uri=redirect_uri,
             response_type="code",
             state="fyers_proxy_state",
             secret_key=config.SECRET_KEY,
@@ -40,9 +72,13 @@ def fyers_login():
             "message": str(e)
         }), 500
 
+
 @fyers_bp.route('/fyers-auth-callback')
 def fyers_auth_callback():
     """Callback endpoint after the user logs in on Fyers."""
+    import os
+    base_url = get_base_url()
+
     auth_code = request.args.get('auth_code')
     state = request.args.get('state')
     error = request.args.get('error')
@@ -111,11 +147,10 @@ FYERS_REFRESH_TOKEN={new_refresh_token[:20]}...
                         <p>The refresh token will be used automatically to maintain access.</p>
                         
                         <h3>🔧 Test Your Setup:</h3>
-                        <p>You can test the API by visiting:</p>
                         <ul>
-                            <li><a href="/api/auth/status" target="_blank">Check Authentication Status</a></li>
-                            <li><a href="/api/fyers/profile" target="_blank">View Profile</a></li>
-                            <li><a href="/health" target="_blank">Health Check</a></li>
+                            <li><a href="{base_url}/api/auth/status" target="_blank">Check Authentication Status</a></li>
+                            <li><a href="{base_url}/api/fyers/profile" target="_blank">View Profile</a></li>
+                            <li><a href="{base_url}/health" target="_blank">Health Check</a></li>
                         </ul>
                         
                         <p style="margin-top: 30px; text-align: center;">
@@ -131,21 +166,22 @@ FYERS_REFRESH_TOKEN={new_refresh_token[:20]}...
                 return jsonify({"error": "Failed to initialize Fyers model with new tokens"}), 500
         else:
             logger.error(f"Failed to generate Fyers tokens. Response: {response}")
-            return jsonify({"error": f"Failed to generate tokens", "response": response}), 500
+            return jsonify({"error": "Failed to generate tokens", "response": response}), 500
 
     except Exception as e:
         logger.error(f"Error generating Fyers access token: {e}", exc_info=True)
         return jsonify({"error": f"Failed to generate access token: {str(e)}"}, 500)
 
+
 @fyers_bp.route('/api/auth/status')
 def auth_status():
     """Check current authentication status"""
+    base_url = get_base_url()
     try:
         has_access = bool(config.ACCESS_TOKEN)
         has_refresh = bool(config.REFRESH_TOKEN)
         fyers_initialized = bool(fyers_instance)
         
-        # Try a simple API call to verify token validity
         token_valid = False
         profile_data = None
         
@@ -165,7 +201,7 @@ def auth_status():
             "fyers_initialized": fyers_initialized,
             "message": "Authenticated and ready" if token_valid else "Authentication required - visit /fyers-login",
             "profile": profile_data if token_valid else None,
-            "login_url": f"{config.FYERS_PROXY_BASE_URL}/fyers-login" if not token_valid else None
+            "login_url": f"{base_url}/fyers-login" if not token_valid else None
         })
     except Exception as e:
         logger.error(f"Error checking auth status: {e}")
@@ -175,17 +211,22 @@ def auth_status():
             "message": "Error checking authentication status"
         }), 500
 
+
+def _unauthenticated_response():
+    """Helper to return a standardized unauthenticated response"""
+    base_url = get_base_url()
+    return jsonify({
+        "error": "Not authenticated",
+        "message": "Please authenticate first by visiting /fyers-login",
+        "login_url": f"{base_url}/fyers-login"
+    }), 401
+
+
 @fyers_bp.route('/api/fyers/profile')
 def get_profile():
-    """Get user profile"""
+    if not fyers_instance:
+        return _unauthenticated_response()
     try:
-        if not fyers_instance:
-            return jsonify({
-                "error": "Not authenticated",
-                "message": "Please authenticate first by visiting /fyers-login",
-                "login_url": f"{config.FYERS_PROXY_BASE_URL}/fyers-login"
-            }), 401
-        
         result = make_fyers_api_call(fyers_instance.get_profile)
         if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], int):
             return result
@@ -194,17 +235,12 @@ def get_profile():
         logger.error(f"Error getting profile: {e}")
         return jsonify({"error": str(e)}), 500
 
+
 @fyers_bp.route('/api/fyers/funds')
 def get_funds():
-    """Get funds information"""
+    if not fyers_instance:
+        return _unauthenticated_response()
     try:
-        if not fyers_instance:
-            return jsonify({
-                "error": "Not authenticated",
-                "message": "Please authenticate first by visiting /fyers-login",
-                "login_url": f"{config.FYERS_PROXY_BASE_URL}/fyers-login"
-            }), 401
-        
         result = make_fyers_api_call(fyers_instance.funds)
         if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], int):
             return result
@@ -213,17 +249,12 @@ def get_funds():
         logger.error(f"Error getting funds: {e}")
         return jsonify({"error": str(e)}), 500
 
+
 @fyers_bp.route('/api/fyers/holdings')
 def get_holdings():
-    """Get holdings information"""
+    if not fyers_instance:
+        return _unauthenticated_response()
     try:
-        if not fyers_instance:
-            return jsonify({
-                "error": "Not authenticated",
-                "message": "Please authenticate first by visiting /fyers-login",
-                "login_url": f"{config.FYERS_PROXY_BASE_URL}/fyers-login"
-            }), 401
-        
         result = make_fyers_api_call(fyers_instance.holdings)
         if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], int):
             return result
@@ -232,17 +263,12 @@ def get_holdings():
         logger.error(f"Error getting holdings: {e}")
         return jsonify({"error": str(e)}), 500
 
+
 @fyers_bp.route('/api/fyers/positions')
 def get_positions():
-    """Get positions information"""
+    if not fyers_instance:
+        return _unauthenticated_response()
     try:
-        if not fyers_instance:
-            return jsonify({
-                "error": "Not authenticated",
-                "message": "Please authenticate first by visiting /fyers-login",
-                "login_url": f"{config.FYERS_PROXY_BASE_URL}/fyers-login"
-            }), 401
-        
         result = make_fyers_api_call(fyers_instance.positions)
         if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], int):
             return result
