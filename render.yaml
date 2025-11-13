@@ -1,13 +1,11 @@
 # This is the permanent instruction file for Render
 services:
   - type: web
-    name: fyers-proxy-server
+    name: fyers-proxy-server # Use your service name
     env: python
-    # This tells Render to automatically install your requirements.txt
     buildCommand: "pip install -r requirements.txt"
     
-    # --- IMPORTANT ---
-    # PASTE THE "START COMMAND" YOU COPIED FROM RENDER'S SETTINGS HERE
+    # Make sure this matches your "Start Command" in Render's settings
     startCommand: "gunicorn app:app"
 
     # --- THE PERMANENT FIX ---
