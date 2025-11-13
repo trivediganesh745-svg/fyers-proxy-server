@@ -18,14 +18,13 @@ from google.generativeai.types import HarmCategory, HarmBlockThreshold
 import asyncio
 import numpy as np
 
-# Load environment variables from .env file (for local development)
+# Load environment variables
 load_dotenv()
 
-# Initialize Flask app FIRST
+# Initialize Flask app
 app = Flask(__name__)
 
 # --- 1. Get Allowed Origins from Environment ---
-# This part is correct. It reads your ALLOWED_ORIGINS variable from Render.
 allowed_origins_str = os.environ.get("ALLOWED_ORIGINS", "")
 allowed_origins = [origin.strip() for origin in allowed_origins_str.split(',') if origin.strip()]
 
@@ -35,34 +34,28 @@ if not allowed_origins:
 else:
     print(f"✅ CORS configured for origins: {allowed_origins}")
 
-
 # --- 2. Configure Flask-CORS (The Right Way) ---
 # This is the single source of truth for all CORS headers.
 CORS(app, 
      resources={r"/*": {"origins": allowed_origins}},
-     supports_credentials=True) # Simplified and correct
+     supports_credentials=True)
 
-# Initialize Sock for client-facing websocket connections
+# Initialize Sock
 sock = Sock(app)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 app.logger.setLevel(logging.INFO)
 
-# --- 3. Remove The Conflicting/Buggy Code ---
-# The old `@app.before_request def handle_options()` function has been DELETED.
-# It was causing a conflict and would crash.
-
-# Add request logging (This is good for debugging)
+# --- 3. Log Incoming Requests for Debugging ---
 @app.before_request
 def log_request_info():
     app.logger.info(f'Request: {request.method} {request.url}')
     app.logger.info(f'Headers: {dict(request.headers)}')
     app.logger.info(f'Origin: {request.headers.get("Origin", "No Origin")}')
 
-
-# --- 4. Fix Iframe Policy in `after_request` ---
-# This function's only job now is to add the security policy for iframes.
+# --- 4. Add Iframe Security Policy to All Responses ---
+# This function's only job is to add the security policy to allow iframes.
 @app.after_request
 def after_request(response):
     # This is the critical header to allow Google AI Studio to embed your app.
@@ -74,8 +67,8 @@ def after_request(response):
     )
     response.headers['Content-Security-Policy'] = csp_value
 
-    # Defensively remove the X-Frame-Options header in case it sneaks in.
-    # The render.yaml file is the primary way to do this.
+    # Defensively remove the X-Frame-Options header. The render.yaml file
+    # from Step 3 is the primary way to do this, but this is a good backup.
     if 'X-Frame-Options' in response.headers:
         del response.headers['X-Frame-Options']
 
