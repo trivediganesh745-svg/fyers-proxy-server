@@ -83,23 +83,41 @@ def handle_options():
         
         return response
 
-# Add CORS headers to all responses
+# Add CORS and Security headers to all responses
 @app.after_request
 def after_request(response):
+    # --- START: Iframe and CORS Fixes ---
+
+    # 1. FIX THE IFRAME ISSUE: Set Content-Security-Policy to allow embedding
+    # This is the most important fix for the initial connection failure.
+    # We are adding the new wildcard domain for Google AI Studio.
+    csp_value = (
+        "frame-ancestors 'self' "
+        "https://*.google.com "
+        "https://*.googleusercontent.com "
+        "https://*.scf.usercontent.goog;"
+    )
+    response.headers['Content-Security-Policy'] = csp_value
+
+    # 2. ENSURE CORS HEADERS ARE CORRECT
+    # The Flask-CORS extension is the primary handler for this, but we can ensure
+    # the origin is reflected correctly.
     origin = request.headers.get('Origin')
     
-    if origin:
-        if "*" in allowed_origins or origin in allowed_origins:
-            response.headers['Access-Control-Allow-Origin'] = origin
-            response.headers['Access-Control-Allow-Credentials'] = 'true'
-        elif allowed_origins:
-            response.headers['Access-Control-Allow-Origin'] = allowed_origins[0]
-    
-    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, PATCH, DELETE, OPTIONS'
-    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, X-Requested-With'
-    
+    # Your `CORS(app, ...)` setup should handle this automatically based on ALLOWED_ORIGINS.
+    # This part is more of a fallback/verification.
+    if origin and ("*" in allowed_origins or origin in allowed_origins):
+        response.headers['Access-Control-Allow-Origin'] = origin
+        response.headers['Access-Control-Allow-Credentials'] = 'true'
+
+    # Remove the old X-Frame-Options header, as CSP is the modern replacement.
+    if 'X-Frame-Options' in response.headers:
+        del response.headers['X-Frame-Options']
+
+    # --- END: Iframe and CORS Fixes ---
+
     app.logger.info(f'Response Status: {response.status}')
-    app.logger.info(f'Response Headers: {dict(response.headers)}')
+    app.logger.info(f'Sending Response Headers: {dict(response.headers)}')
     
     return response
 
