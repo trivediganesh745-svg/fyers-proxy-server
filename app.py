@@ -24,29 +24,23 @@ load_dotenv()
 # Initialize Flask app FIRST
 app = Flask(__name__)
 
-# Get allowed origins from environment
+# --- 1. Get Allowed Origins from Environment ---
+# This part is correct. It reads your ALLOWED_ORIGINS variable from Render.
 allowed_origins_str = os.environ.get("ALLOWED_ORIGINS", "")
 allowed_origins = [origin.strip() for origin in allowed_origins_str.split(',') if origin.strip()]
 
-# For development/debugging - allow all origins if none specified
 if not allowed_origins:
     allowed_origins = ["*"]
-    print("⚠️ WARNING: No ALLOWED_ORIGINS set. Allowing all origins (INSECURE!)")
+    print("⚠️ WARNING: No ALLOWED_ORIGINS set. Allowing all origins.")
 else:
     print(f"✅ CORS configured for origins: {allowed_origins}")
 
-# Configure CORS
+
+# --- 2. Configure Flask-CORS (The Right Way) ---
+# This is the single source of truth for all CORS headers.
 CORS(app, 
-     resources={
-         r"/*": {
-             "origins": allowed_origins,
-             "methods": ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-             "allow_headers": ["Content-Type", "Authorization", "X-Requested-With"],
-             "expose_headers": ["Content-Type"],
-             "supports_credentials": True,
-             "max_age": 3600
-         }
-     })
+     resources={r"/*": {"origins": allowed_origins}},
+     supports_credentials=True) # Simplified and correct
 
 # Initialize Sock for client-facing websocket connections
 sock = Sock(app)
@@ -55,42 +49,23 @@ sock = Sock(app)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 app.logger.setLevel(logging.INFO)
 
-# Add request logging
+# --- 3. Remove The Conflicting/Buggy Code ---
+# The old `@app.before_request def handle_options()` function has been DELETED.
+# It was causing a conflict and would crash.
+
+# Add request logging (This is good for debugging)
 @app.before_request
 def log_request_info():
     app.logger.info(f'Request: {request.method} {request.url}')
     app.logger.info(f'Headers: {dict(request.headers)}')
     app.logger.info(f'Origin: {request.headers.get("Origin", "No Origin")}')
 
-# Handle OPTIONS requests explicitly
-@app.before_request
-def handle_options():
-    if request.method == "OPTIONS":
-        response = make_response("", 204)
-        origin = request.headers.get('Origin')
-        
-        # Check if origin is allowed
-        if origin:
-            if "*" in allowed_origins or origin in allowed_origins:
-                response.headers['Access-Control-Allow-Origin'] = origin
-            else:
-                response.headers['Access-Control-Allow-Origin'] = allowed_origins[0] if allowed_origins else "*"
-        
-        response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, PATCH, DELETE, OPTIONS'
-        response.headers['Access-Control-Allow-Headers'] = request.headers.get('Access-Control-Request-Headers', 'Content-Type, Authorization')
-        response.headers['Access-Control-Allow-Credentials'] = 'true'
-        response.headers['Access-Control-Max-Age'] = '3600'
-        
-        return response
 
-# Add CORS and Security headers to all responses
+# --- 4. Fix Iframe Policy in `after_request` ---
+# This function's only job now is to add the security policy for iframes.
 @app.after_request
 def after_request(response):
-    # --- START: Iframe and CORS Fixes ---
-
-    # 1. FIX THE IFRAME ISSUE: Set Content-Security-Policy to allow embedding
-    # This is the most important fix for the initial connection failure.
-    # We are adding the new wildcard domain for Google AI Studio.
+    # This is the critical header to allow Google AI Studio to embed your app.
     csp_value = (
         "frame-ancestors 'self' "
         "https://*.google.com "
@@ -99,22 +74,10 @@ def after_request(response):
     )
     response.headers['Content-Security-Policy'] = csp_value
 
-    # 2. ENSURE CORS HEADERS ARE CORRECT
-    # The Flask-CORS extension is the primary handler for this, but we can ensure
-    # the origin is reflected correctly.
-    origin = request.headers.get('Origin')
-    
-    # Your `CORS(app, ...)` setup should handle this automatically based on ALLOWED_ORIGINS.
-    # This part is more of a fallback/verification.
-    if origin and ("*" in allowed_origins or origin in allowed_origins):
-        response.headers['Access-Control-Allow-Origin'] = origin
-        response.headers['Access-Control-Allow-Credentials'] = 'true'
-
-    # Remove the old X-Frame-Options header, as CSP is the modern replacement.
+    # Defensively remove the X-Frame-Options header in case it sneaks in.
+    # The render.yaml file is the primary way to do this.
     if 'X-Frame-Options' in response.headers:
         del response.headers['X-Frame-Options']
-
-    # --- END: Iframe and CORS Fixes ---
 
     app.logger.info(f'Response Status: {response.status}')
     app.logger.info(f'Sending Response Headers: {dict(response.headers)}')
