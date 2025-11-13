@@ -25,14 +25,21 @@ load_dotenv()
 app = Flask(__name__)
 
 # --- 1. Get Allowed Origins from Environment ---
+allow_all_str = os.environ.get("ALLOW_ALL_ORIGINS", "false").lower()
 allowed_origins_str = os.environ.get("ALLOWED_ORIGINS", "")
-allowed_origins = [origin.strip() for origin in allowed_origins_str.split(',') if origin.strip()]
 
-if not allowed_origins:
-    allowed_origins = ["*"]
-    print("⚠️ WARNING: No ALLOWED_ORIGINS set. Allowing all origins.")
+if allow_all_str in ['true', '1', 'yes']:
+    allowed_origins = "*"
+    print("✅ CORS configured to allow ALL origins (ALLOW_ALL_ORIGINS is true).")
 else:
-    print(f"✅ CORS configured for origins: {allowed_origins}")
+    # Clean up the string from potential quotes or backticks
+    allowed_origins = [origin.strip().strip("'\"`") for origin in allowed_origins_str.split(',') if origin.strip()]
+    if not allowed_origins:
+        # Default to an empty list for safety if nothing is specified
+        allowed_origins = [] 
+        print("⚠️ WARNING: No ALLOWED_ORIGINS set. CORS may block requests.")
+    else:
+        print(f"✅ CORS configured for specific origins: {allowed_origins}")
 
 # --- 2. Configure Flask-CORS (The Right Way) ---
 # This is the single source of truth for all CORS headers.
